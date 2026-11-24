@@ -1,13 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
+import { render, screen } from '@testing-library/react';
 import type React from 'react';
 import { TestApp } from '@/test/TestApp';
 import { AISettings } from './AISettings';
 
-// Mock the hooks
 vi.mock('@/hooks/useCurrentUser', () => ({
-  useCurrentUser: vi.fn(),
+  useCurrentUser: vi.fn(() => ({ user: undefined, users: [] })),
 }));
 
 vi.mock('@/hooks/useAISettings', () => ({
@@ -41,73 +39,15 @@ vi.mock('react-router', async () => {
 });
 
 describe('AISettings', () => {
-  it('shows Nostr login requirement for Nostr presets when user is not logged in', async () => {
-    const { useCurrentUser } = await import('@/hooks/useCurrentUser');
-    vi.mocked(useCurrentUser).mockReturnValue({
-      user: undefined,
-      users: [],
-    });
-
-    const user = userEvent.setup();
-
+  it('shows pure AI provider tiles for standard presets without Nostr dependency', () => {
     render(
       <TestApp>
         <AISettings />
-      </TestApp>
+      </TestApp>,
     );
 
-    // Find and click on the Shakespeare AI tile (Nostr preset)
-    const shakespeareTile = screen.getByText('Shakespeare AI');
-    await user.click(shakespeareTile);
-
-    // Wait for dialog to open and show login requirement
-    await waitFor(() => {
-      expect(screen.getByText('Log in to Nostr to use this provider')).toBeInTheDocument();
-    });
-    expect(screen.getByText('Go to Nostr Settings')).toBeInTheDocument();
-  });
-
-  it('shows API key input for Nostr presets when user is logged in', async () => {
-    const { useCurrentUser } = await import('@/hooks/useCurrentUser');
-    vi.mocked(useCurrentUser).mockReturnValue({
-      user: { pubkey: 'test-pubkey' } as NonNullable<ReturnType<typeof useCurrentUser>['user']>,
-      users: [],
-    });
-
-    const user = userEvent.setup();
-
-    render(
-      <TestApp>
-        <AISettings />
-      </TestApp>
-    );
-
-    // Find and click on the Shakespeare AI tile (Nostr preset)
-    const shakespeareTile = screen.getByText('Shakespeare AI');
-    await user.click(shakespeareTile);
-
-    // Wait for dialog to open - should NOT show login requirement
-    await waitFor(() => {
-      expect(screen.queryByText('Log in to Nostr to use this provider')).not.toBeInTheDocument();
-    });
-  });
-
-  it('shows provider tiles for presets', async () => {
-    const { useCurrentUser } = await import('@/hooks/useCurrentUser');
-    vi.mocked(useCurrentUser).mockReturnValue({
-      user: undefined,
-      users: [],
-    });
-
-    render(
-      <TestApp>
-        <AISettings />
-      </TestApp>
-    );
-
-    // Should show provider tiles for presets like OpenAI
     expect(screen.getByText('OpenAI')).toBeInTheDocument();
     expect(screen.getByText('OpenRouter')).toBeInTheDocument();
-    expect(screen.getByText('Shakespeare AI')).toBeInTheDocument();
+    expect(screen.queryByText('Shakespeare AI')).not.toBeInTheDocument();
   });
 });

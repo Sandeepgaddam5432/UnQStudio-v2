@@ -60,8 +60,8 @@ describe('ProjectSidebar', () => {
       </TestApp>
     );
 
-    expect(screen.getByAltText('Shakespeare')).toBeInTheDocument();
-    expect(screen.getByText('Shakespeare')).toBeInTheDocument();
+    expect(screen.getByAltText(/UnQStudio|AI Studio/i)).toBeInTheDocument();
+    expect(screen.getByText(/UnQStudio|AI Studio/i)).toBeInTheDocument();
   });
 
   it('shows collapse button when onToggleSidebar is provided', () => {

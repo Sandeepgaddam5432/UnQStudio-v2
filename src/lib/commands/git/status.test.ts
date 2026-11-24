@@ -62,8 +62,8 @@ describe('git status', () => {
   });
 
   it('describes a repository with no commits', async () => {
-    await sh.ok('mkdir /projects/empty');
-    const run = (cmd: string) => sh.ok(`cd /projects/empty && ${cmd}`);
+    await sh.ok('mkdir -p /tmp/empty');
+    const run = (cmd: string) => sh.ok(`cd /tmp/empty && ${cmd}`);
     await run('git init -q');
     expect(await run('git status')).toBe('On branch main\n\nNo commits yet\n\nnothing to commit (create/copy files and use "git add" to track)\n');
     await run('echo a > a && git add a');

@@ -17,7 +17,8 @@ export class MockFS implements JSRuntimeFS {
   async readFile(path: string, options: { encoding: 'utf8' }): Promise<string>;
   async readFile(path: string, options: { encoding: string }): Promise<string>;
   async readFile(path: string, options?: string | { encoding?: string }): Promise<string | Uint8Array>;
-  async readFile(path: string, options?: string | { encoding?: string }): Promise<string | Uint8Array> {
+  async readFile(rawPath: string, options?: string | { encoding?: string }): Promise<string | Uint8Array> {
+    const path = this.normalizePath(rawPath);
     const content = this.files.get(path);
     if (content === undefined) {
       const error = new Error(`ENOENT: no such file or directory, open '${path}'`) as NodeJS.ErrnoException;
@@ -33,7 +34,8 @@ export class MockFS implements JSRuntimeFS {
     return content as Uint8Array;
   }
 
-  async writeFile(path: string, data: string | Uint8Array): Promise<void> {
+  async writeFile(rawPath: string, data: string | Uint8Array): Promise<void> {
+    const path = this.normalizePath(rawPath);
     this.files.set(path, data);
     const dir = path.split('/').slice(0, -1).join('/') || '/';
     this.dirs.add(dir);
@@ -42,7 +44,8 @@ export class MockFS implements JSRuntimeFS {
   readdir(path: string): Promise<string[]>;
   readdir(path: string, options: { withFileTypes: true }): Promise<DirectoryEntry[]>;
   readdir(path: string, options?: { withFileTypes?: boolean }): Promise<string[] | DirectoryEntry[]>;
-  async readdir(path: string, options?: { withFileTypes?: boolean }): Promise<string[] | DirectoryEntry[]> {
+  async readdir(rawPath: string, options?: { withFileTypes?: boolean }): Promise<string[] | DirectoryEntry[]> {
+    const path = this.normalizePath(rawPath);
     if (!this.dirs.has(path)) {
       const error = new Error(`ENOENT: no such file or directory, scandir '${path}'`) as NodeJS.ErrnoException;
       error.code = 'ENOENT';
@@ -90,7 +93,15 @@ export class MockFS implements JSRuntimeFS {
     this.dirs.add(path);
   }
 
-  async stat(path: string): Promise<{
+  private normalizePath(rawPath: string): string {
+    if (!rawPath || rawPath === '.' || rawPath === './') return '/';
+    let p = rawPath.replace(/\/+$/, '') || '/';
+    if (p.endsWith('/.')) p = p.slice(0, -2) || '/';
+    if (!p.startsWith('/')) p = `/${p}`;
+    return p;
+  }
+
+  async stat(rawPath: string): Promise<{
     isDirectory(): boolean;
     isFile(): boolean;
     isSymbolicLink(): boolean;
@@ -104,6 +115,7 @@ export class MockFS implements JSRuntimeFS {
     uid?: number;
     gid?: number;
   }> {
+    const path = this.normalizePath(rawPath);
     const now = new Date();
     const nowMs = now.getTime();
     if (this.dirs.has(path)) {
