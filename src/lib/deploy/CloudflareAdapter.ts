@@ -3,7 +3,7 @@ import type { DeployAdapter, DeployOptions, DeployResult, CloudflareDeployConfig
 import { proxyUrl } from '../proxyUrl';
 import { parse as parseJsonc } from 'jsonc-parser';
 import { join } from 'path-browserify';
-import { readBuildContext, createPlugins } from '../build';
+import { readBuildContext, createPlugins } from '../bundler';
 import { getEsbuild } from '../esbuild';
 
 interface AssetManifest {

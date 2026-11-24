@@ -1,6 +1,6 @@
 import type { Tool, ToolResult } from "./Tool";
 import type { JSRuntimeFS } from "../JSRuntime";
-import { buildProject } from "../build";
+import { buildProject } from "../bundler";
 
 export class BuildProjectTool implements Tool<void> {
   private fs: JSRuntimeFS;

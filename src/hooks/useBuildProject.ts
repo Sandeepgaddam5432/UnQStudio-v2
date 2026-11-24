@@ -1,5 +1,5 @@
 import { useMutation } from "@tanstack/react-query";
-import { buildProject } from "@/lib/build";
+import { buildProject } from "@/lib/bundler";
 import { useFS } from "./useFS";
 import { useFSPaths } from "./useFSPaths";
 import { useAppContext } from "./useAppContext";

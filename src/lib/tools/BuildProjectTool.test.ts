@@ -3,11 +3,11 @@ import { BuildProjectTool } from './BuildProjectTool';
 import type { JSRuntimeFS } from '../JSRuntime';
 
 // Mock the build functions
-vi.mock('../build', () => ({
+vi.mock('../bundler', () => ({
   buildProject: vi.fn(),
 }));
 
-import { buildProject } from '../build';
+import { buildProject } from '../bundler';
 
 describe('BuildProjectTool', () => {
   let mockFS: JSRuntimeFS;
