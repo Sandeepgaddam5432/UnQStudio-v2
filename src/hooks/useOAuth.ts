@@ -137,9 +137,10 @@ export function useOAuth(config: OAuthConfig) {
     code: string,
     state: string
   ): Promise<OAuthResult | null> => {
+    const currentConfig = configRef.current;
     setState(prev => ({ ...prev, isLoading: true, error: null }));
 
-    const storagePrefix = `${config.provider}_oauth`;
+    const storagePrefix = `${currentConfig.provider}_oauth`;
 
     try {
       // Verify state parameter
@@ -150,15 +151,15 @@ export function useOAuth(config: OAuthConfig) {
 
       // Build token request body
       const tokenRequestBody: Record<string, string> = {
-        client_id: config.clientId,
-        client_secret: config.clientSecret,
+        client_id: currentConfig.clientId,
+        client_secret: currentConfig.clientSecret,
         code: code,
-        redirect_uri: config.redirectUri,
+        redirect_uri: currentConfig.redirectUri,
         grant_type: 'authorization_code',
       };
 
       // Add PKCE code verifier if enabled
-      if (config.usePKCE) {
+      if (currentConfig.usePKCE) {
         const codeVerifier = localStorage.getItem(`${storagePrefix}_code_verifier`);
         if (!codeVerifier) {
           throw new Error('PKCE code verifier not found. Please restart the OAuth flow.');
@@ -168,12 +169,12 @@ export function useOAuth(config: OAuthConfig) {
 
       // Clean up stored values
       localStorage.removeItem(`${storagePrefix}_state`);
-      if (config.usePKCE) {
+      if (currentConfig.usePKCE) {
         localStorage.removeItem(`${storagePrefix}_code_verifier`);
       }
 
       // Exchange code for access token
-      const tokenUrl = proxyUrl({ template: corsProxy, url: config.tokenUrl });
+      const tokenUrl = proxyUrl({ template: corsProxy, url: currentConfig.tokenUrl });
       const tokenResponse = await fetch(tokenUrl, {
         method: 'POST',
         headers: {
@@ -201,13 +202,13 @@ export function useOAuth(config: OAuthConfig) {
       };
 
       // Get user info if getUserInfo function is provided
-      if (config.getUserInfo) {
+      if (currentConfig.getUserInfo) {
         try {
-          const userData = await config.getUserInfo(tokenData.access_token, corsProxy);
+          const userData = await currentConfig.getUserInfo(tokenData.access_token, corsProxy);
           result.username = userData.username;
           result.userData = userData;
         } catch (error) {
-          console.warn(`Failed to fetch user info for ${config.provider}:`, error);
+          console.warn(`Failed to fetch user info for ${currentConfig.provider}:`, error);
           // Continue without user info - it's optional
         }
       }
@@ -215,11 +216,11 @@ export function useOAuth(config: OAuthConfig) {
       setState(prev => ({ ...prev, isLoading: false }));
       return result;
     } catch (error) {
-      console.error(`${config.provider} OAuth error:`, error);
+      console.error(`${currentConfig.provider} OAuth error:`, error);
 
       // Clean up any remaining OAuth data on error
       localStorage.removeItem(`${storagePrefix}_state`);
-      if (config.usePKCE) {
+      if (currentConfig.usePKCE) {
         localStorage.removeItem(`${storagePrefix}_code_verifier`);
       }
 

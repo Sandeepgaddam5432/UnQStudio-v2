@@ -2,12 +2,8 @@
  * Optional Env-Driven ESM CDN Cache Worker (Cloudflare Workers).
  * Fixes F-022: only caches 2xx responses as immutable; never caches 4xx/5xx errors.
  */
-export interface EsmEnv {
-  APP_URL?: string;
-}
-
 export default {
-  async fetch(request: Request, env?: EsmEnv): Promise<Response> {
+  async fetch(request, env) {
     const url = new URL(request.url);
 
     if (url.pathname === "/") {
@@ -23,7 +19,7 @@ export default {
     try {
       const response = await fetch(url.toString(), {
         cf: { cacheEverything: true },
-      } as RequestInit);
+      });
 
       const headers = new Headers(response.headers);
       if (response.ok) {
