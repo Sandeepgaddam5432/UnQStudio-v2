@@ -34,11 +34,22 @@ export class MockFS implements JSRuntimeFS {
     return content as Uint8Array;
   }
 
+  private ensureDirs(dirPath: string): void {
+    const normalized = this.normalizePath(dirPath);
+    const parts = normalized.split('/').filter(Boolean);
+    let current = '';
+    this.dirs.add('/');
+    for (const part of parts) {
+      current += `/${part}`;
+      this.dirs.add(current);
+    }
+  }
+
   async writeFile(rawPath: string, data: string | Uint8Array): Promise<void> {
     const path = this.normalizePath(rawPath);
     this.files.set(path, data);
     const dir = path.split('/').slice(0, -1).join('/') || '/';
-    this.dirs.add(dir);
+    this.ensureDirs(dir);
   }
 
   readdir(path: string): Promise<string[]>;
@@ -89,8 +100,8 @@ export class MockFS implements JSRuntimeFS {
     return uniqueEntries;
   }
 
-  async mkdir(path: string): Promise<void> {
-    this.dirs.add(path);
+  async mkdir(rawPath: string): Promise<void> {
+    this.ensureDirs(rawPath);
   }
 
   private normalizePath(rawPath: string): string {
