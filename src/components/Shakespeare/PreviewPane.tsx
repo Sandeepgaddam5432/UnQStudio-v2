@@ -1,0 +1,1072 @@
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useProjectsManager } from '@/hooks/useProjectsManager';
+import { useFS } from '@/hooks/useFS';
+import { useFSPaths } from '@/hooks/useFSPaths';
+import { addConsoleMessage, getConsoleMessages, type ConsoleMessage } from '@/lib/consoleMessages';
+import { useConsoleError } from '@/hooks/useConsoleError';
+import { useBuildProject } from '@/hooks/useBuildProject';
+import { Tabs, TabsContent } from '@/components/ui/tabs';
+import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area';
+import { Button } from '@/components/ui/button';
+import { FolderOpen, ArrowLeft, Bug, Copy, Check, Loader2, Code, X, Terminal, Expand, Shrink, Hammer, RefreshCw } from 'lucide-react';
+import { useIsMobile } from '@/hooks/useIsMobile';
+import { GitStatusIndicator } from '@/components/GitStatusIndicator';
+import { BranchSwitcher } from '@/components/BranchSwitcher';
+import { BrowserAddressBar } from '@/components/ui/browser-address-bar';
+import { type DeviceMode } from '@/components/ui/device-toggle';
+import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from '@/components/ui/resizable';
+import type { ImperativePanelHandle } from 'react-resizable-panels';
+import { cn } from '@/lib/utils';
+import { FileTree } from './FileTree';
+import { FileEditor } from './FileEditor';
+import { Terminal as TerminalComponent } from '@/components/Terminal';
+import { useSearchParams } from 'react-router';
+import { useAppContext } from '@/hooks/useAppContext';
+import { isMediaFile } from '@/lib/fileUtils';
+import { deriveIframeSubdomain } from '@/lib/iframeSubdomain';
+import { getPreviewInjectedScript } from '@/lib/previewInjectedScript';
+import { servePreviewFile } from '@/lib/preview/servePreviewFile';
+import { getPreviewNostrProviderScript } from '@/lib/previewNostrProvider';
+import { useCurrentUser } from '@/hooks/useCurrentUser';
+import { usePreviewSignerRpc } from '@/hooks/usePreviewSignerRpc';
+import { PreviewPermissionPrompt } from './PreviewPermissionPrompt';
+import { buildStaticSrcDoc } from '@/lib/preview/buildStaticSrcDoc';
+
+interface PreviewPaneProps {
+  projectId: string;
+  activeTab: 'preview' | 'code';
+  onToggleView?: () => void;
+  isPreviewable?: boolean;
+}
+
+interface JSONRPCRequest {
+  jsonrpc: '2.0';
+  method: string;
+  params: {
+    request: {
+      url: string;
+      method: string;
+      headers: Record<string, string>;
+      body: string | null;
+    }
+  };
+  id: number;
+}
+
+interface JSONRPCResponse {
+  jsonrpc: '2.0';
+  result?: {
+    status: number;
+    statusText: string;
+    headers: Record<string, string>;
+    body: string | null;
+  }
+  error?: {
+    code: number;
+    message: string;
+    data?: Record<string, unknown>;
+  };
+  id: number;
+}
+
+export function PreviewPane({ projectId, activeTab, onToggleView, isPreviewable = true }: PreviewPaneProps) {
+  const { t } = useTranslation();
+  const { config } = useAppContext();
+  const { previewDomain } = config;
+
+  // Derive a private, stable subdomain from a device-local seed + the project ID.
+  // This prevents malicious project names from colliding with another project's
+  // origin on iframe.diy, protecting localStorage/IndexedDB isolation.
+  const previewSubdomain = useMemo(() => deriveIframeSubdomain('preview', projectId), [projectId]);
+  const isStaticPreview = !previewDomain || previewDomain.trim() === '';
+  const previewOrigin = useMemo(
+    () => (isStaticPreview ? '' : `https://${previewSubdomain}.${previewDomain}`),
+    [previewSubdomain, previewDomain, isStaticPreview],
+  );
+  const [staticSrcDoc, setStaticSrcDoc] = useState<string>('');
+
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [fileContent, setFileContent] = useState<string>('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [mobileCodeView, setMobileCodeView] = useState<'explorer' | 'editor' | 'terminal'>('explorer');
+  const [desktopCodeView, setDesktopCodeView] = useState<'files' | 'terminal'>('files');
+  const isMobile = useIsMobile();
+  const [hasBuiltProject, setHasBuiltProject] = useState(false);
+  const [buildError, setBuildError] = useState<string | null>(null);
+  const [currentPath, setCurrentPath] = useState('/');
+  const [navigationHistory, setNavigationHistory] = useState<string[]>(['/']);
+  const [historyIndex, setHistoryIndex] = useState(0);
+
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [deviceMode, setDeviceMode] = useState<DeviceMode>('laptop');
+  const [isLogsOpen, setIsLogsOpen] = useState(false);
+  // Incremented to force a full remount of the preview iframe. Using a
+  // remount (via React key) is more reliable than sending a `refresh`
+  // JSON-RPC to the nested iframe.diy frames: messages can be silently
+  // dropped if the inner iframe is mid-reload, not yet mounted, or if
+  // the outer frame's handshake is still pending. A remount always works.
+  const [iframeReloadKey, setIframeReloadKey] = useState(0);
+  const previewContainerRef = useRef<HTMLDivElement>(null);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const iframePanelRef = useRef<ImperativePanelHandle>(null);
+  const logsPanelRef = useRef<ImperativePanelHandle>(null);
+  const { fs } = useFS();
+  const { projectsPath } = useFSPaths();
+  const projectsManager = useProjectsManager();
+  const { user } = useCurrentUser();
+  const signerRpc = usePreviewSignerRpc(projectId);
+
+  // Use console error state from provider
+  const { hasErrors: hasConsoleErrors, clearErrors } = useConsoleError();
+
+  const { mutate: buildProject, isPending: isBuildLoading } = useBuildProject(projectId);
+
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [shouldBuild, setShouldBuild] = useState(false);
+
+  // Handle "build" URL parameter on initial load
+  useEffect(() => {
+    if (searchParams.has('build')) {
+      setShouldBuild(true);
+
+      // Remove the build parameter from URL
+      const newSearchParams = new URLSearchParams(searchParams);
+      newSearchParams.delete('build');
+      setSearchParams(newSearchParams, { replace: true });
+    }
+  }, [searchParams, setSearchParams]);
+
+  // Build automatically if "build" parameter was present
+  useEffect(() => {
+    if (shouldBuild && isPreviewable && !isBuildLoading) {
+      setShouldBuild(false);
+      buildProject(undefined, {
+        onError: (error) => {
+          console.error('Build failed:', error);
+        }
+      });
+    }
+  }, [isBuildLoading, isPreviewable, buildProject, shouldBuild]);
+
+  const loadFileContent = useCallback(async (filePath: string) => {
+    // Skip loading media files - they can't be edited as text
+    if (isMediaFile(filePath)) {
+      setFileContent('');
+      setIsLoading(false);
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const content = await projectsManager.readFile(projectId, filePath);
+      setFileContent(content);
+    } catch (_error) {
+      console.error('Failed to load file:', _error);
+      setFileContent('');
+    } finally {
+      setIsLoading(false);
+    }
+  }, [projectId, projectsManager]);
+
+  const checkForBuiltProject = useCallback(async () => {
+    try {
+      const exists = await projectsManager.fileExists(projectId, 'dist/index.html');
+      setHasBuiltProject(exists);
+      if (exists && isStaticPreview) {
+        try {
+          const doc = await buildStaticSrcDoc(fs, `${projectsPath}/${projectId}/dist`);
+          setStaticSrcDoc(doc);
+        } catch (err) {
+          console.error('Failed to build static srcDoc preview:', err);
+        }
+      }
+    } catch (error) {
+      console.error('Failed to check for built project:', error);
+      setHasBuiltProject(false);
+    }
+  }, [projectId, projectsManager, isStaticPreview, fs, projectsPath]);
+
+  // Refresh static srcDoc whenever iframeReloadKey bumps
+  useEffect(() => {
+    if (!isStaticPreview || !hasBuiltProject) return;
+    let cancelled = false;
+    buildStaticSrcDoc(fs, `${projectsPath}/${projectId}/dist`)
+      .then((doc) => {
+        if (!cancelled) setStaticSrcDoc(doc);
+      })
+      .catch((err) => console.error('Failed to refresh static preview:', err));
+    return () => {
+      cancelled = true;
+    };
+  }, [isStaticPreview, hasBuiltProject, iframeReloadKey, fs, projectsPath, projectId]);
+
+
+
+  const sendResponse = useCallback((message: JSONRPCResponse) => {
+    if (iframeRef.current?.contentWindow) {
+      iframeRef.current.contentWindow.postMessage(message, previewOrigin);
+    }
+  }, [previewOrigin]);
+
+  const sendError = useCallback((message: JSONRPCResponse) => {
+    if (iframeRef.current?.contentWindow) {
+      iframeRef.current.contentWindow.postMessage(message, previewOrigin);
+    }
+  }, [previewOrigin]);
+
+  const handleConsoleMessage = useCallback((message: {
+    jsonrpc: '2.0';
+    method: 'console';
+    params: {
+      level: 'log' | 'warn' | 'error' | 'info' | 'debug';
+      message: string;
+    };
+  }) => {
+    const { params } = message;
+
+    // Normalize level to ensure it's one of our supported types
+    let normalizedLevel: ConsoleMessage['level'] = 'log';
+    if (['log', 'warn', 'error', 'info', 'debug'].includes(params.level)) {
+      normalizedLevel = params.level as ConsoleMessage['level'];
+    }
+
+    // Add to console messages
+    addConsoleMessage(normalizedLevel, params.message);
+
+    // Log to parent console for debugging with appropriate level
+    console[normalizedLevel](`[IFRAME ${params.level.toUpperCase()}] ${params.message}`);
+  }, []);
+
+  const handleUpdateNavigationState = useCallback((message: {
+    jsonrpc: '2.0';
+    method: 'updateNavigationState';
+    params: {
+      currentUrl: string;
+      canGoBack: boolean;
+      canGoForward: boolean;
+    };
+  }) => {
+    const { params } = message;
+
+    try {
+      // params.currentUrl is now just a semantic path (e.g., "/about", "/contact?param=value#section")
+      const path = params.currentUrl;
+
+      setCurrentPath(path);
+
+      // Update navigation history if this is a new navigation
+      // But only if it's different from current path (avoid duplicates)
+      if (path !== navigationHistory[historyIndex]) {
+        const newHistory = navigationHistory.slice(0, historyIndex + 1);
+        newHistory.push(path);
+        setNavigationHistory(newHistory);
+        setHistoryIndex(newHistory.length - 1);
+      }
+    } catch (error) {
+      console.error('Failed to handle navigation state:', params.currentUrl, error);
+    }
+  }, [historyIndex, navigationHistory]);
+
+  const sendNotification = useCallback((method: string, params?: Record<string, unknown>) => {
+    if (iframeRef.current?.contentWindow) {
+      const message = {
+        jsonrpc: '2.0' as const,
+        method,
+        params: params || {},
+      };
+      iframeRef.current.contentWindow.postMessage(message, previewOrigin);
+    }
+  }, [previewOrigin]);
+
+  const sendNavigationCommand = useCallback((method: string, params?: Record<string, unknown>) => {
+    if (iframeRef.current?.contentWindow) {
+      const message = {
+        jsonrpc: '2.0',
+        method,
+        params: params || {},
+        id: Date.now()
+      };
+      iframeRef.current.contentWindow.postMessage(message, previewOrigin);
+    }
+  }, [previewOrigin]);
+
+  const navigateIframe = useCallback((url: string) => {
+    // Send semantic path directly (e.g., "/about", "/contact")
+    // The iframe's NavigationHandler will handle this as semantic navigation
+    sendNavigationCommand('navigate', { url });
+  }, [sendNavigationCommand]);
+
+  const refreshIframe = useCallback(() => {
+    // Force a full remount of the iframe rather than sending a `refresh`
+    // JSON-RPC command. The RPC path is unreliable during rapid build
+    // cycles because the command has to traverse two iframes (outer
+    // iframe.diy frame → inner app iframe) and can be silently dropped
+    // if the inner iframe is mid-reload, not yet mounted, or the outer
+    // frame's handshake is still pending.
+    setIframeReloadKey((n) => n + 1);
+  }, []);
+
+  const toggleFullscreen = useCallback(() => {
+    setIsFullscreen(prev => !prev);
+  }, []);
+
+  /**
+   * Scripts served at virtual paths and injected into HTML responses. When a
+   * user is logged in, a NIP-07 provider lets the app use their signer.
+   */
+  const injectedScripts = useMemo(() => {
+    const scripts = new Map([['/__injected__/preview.js', getPreviewInjectedScript()]]);
+    if (user) {
+      scripts.set('/__injected__/nostr-provider.js', getPreviewNostrProviderScript(user.pubkey));
+    }
+    return scripts;
+  }, [user]);
+
+  const handleFetch = useCallback(async (request: JSONRPCRequest) => {
+    const { params, id } = request;
+    const { request: fetchRequest } = params;
+
+    try {
+      // Parse the URL and validate origin
+      const url = new URL(fetchRequest.url);
+
+      if (url.origin !== previewOrigin) {
+        console.log(`Invalid origin: ${url.origin}, expected: ${previewOrigin}`);
+        sendError({
+          jsonrpc: '2.0',
+          error: {
+            code: -32003,
+            message: 'Invalid URL - origin mismatch',
+            data: { url: fetchRequest.url, expectedOrigin: previewOrigin }
+          },
+          id
+        });
+        return;
+      }
+
+      const result = await servePreviewFile(url.pathname, {
+        readDistFile: (path) => projectsManager.readFileBytes(projectId, 'dist' + path),
+        injectedScripts,
+      });
+      sendResponse({ jsonrpc: '2.0', result, id });
+    } catch (error) {
+      console.error('Error processing fetch request:', error);
+      sendError({
+        jsonrpc: '2.0',
+        error: {
+          code: -32002,
+          message: 'Request processing error',
+          data: { url: fetchRequest.url, error: String(error) }
+        },
+        id
+      });
+    }
+  }, [projectId, projectsManager, sendResponse, sendError, previewOrigin, injectedScripts]);
+
+  const { onRpc: onSignerRpc } = signerRpc;
+  const handleSignerRpc = useCallback(async (message: { id: string | number; method: string; params?: unknown }) => {
+    const { id } = message;
+    let reply: Record<string, unknown>;
+    try {
+      const result = await onSignerRpc(message.method, message.params);
+      reply = { jsonrpc: '2.0', id, result: result ?? null };
+    } catch (error) {
+      reply = { jsonrpc: '2.0', id, error: { code: -1, message: error instanceof Error ? error.message : String(error) } };
+    }
+    iframeRef.current?.contentWindow?.postMessage(reply, previewOrigin);
+  }, [onSignerRpc, previewOrigin]);
+
+  // Setup messaging protocol for iframe communication
+  useEffect(() => {
+    const handleMessage = (event: MessageEvent) => {
+      // Strictly bind messages to our active preview iframe window
+      if (!iframeRef.current?.contentWindow || event.source !== iframeRef.current.contentWindow) {
+        return;
+      }
+
+      const message = event.data;
+      if (!message || typeof message !== 'object' || message.jsonrpc !== '2.0') return;
+
+      // Static sandboxed srcDoc preview emits opaque origin 'null' — only accept console forwarding
+      if (isStaticPreview) {
+        if (message.method === 'studio:console' && message.params) {
+          handleConsoleMessage({
+            jsonrpc: '2.0',
+            method: 'console',
+            params: message.params,
+          });
+        }
+        return;
+      }
+
+      // Verify origin for external subdomain preview
+      if (event.origin !== previewOrigin) {
+        return;
+      }
+
+      // Handle iframe.diy handshake: respond to "ready" with "init"
+      if (message.method === 'ready') {
+        sendNotification('init', { version: 1 });
+        return;
+      }
+
+      if (message.method === 'fetch') {
+        handleFetch(message);
+      } else if (message.method === 'console') {
+        handleConsoleMessage(message);
+      } else if (message.method === 'updateNavigationState') {
+        handleUpdateNavigationState(message);
+      } else if (typeof message.method === 'string' && message.method.startsWith('nostr.') && message.id !== undefined) {
+        handleSignerRpc(message);
+      }
+    };
+
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, [handleFetch, handleConsoleMessage, handleUpdateNavigationState, handleSignerRpc, sendNotification, previewOrigin, isStaticPreview]);
+
+  useEffect(() => {
+    if (selectedFile) {
+      loadFileContent(selectedFile);
+    }
+  }, [selectedFile, loadFileContent]);
+
+  // Reset selected file and navigation history when projectId changes
+  const prevProjectIdRef = useRef<string>();
+  useEffect(() => {
+    setSelectedFile(null);
+    setFileContent('');
+    setMobileCodeView('explorer');
+    setDesktopCodeView('files');
+    setBuildError(null);
+
+    // Reset navigation history and state
+    setCurrentPath('/');
+    setNavigationHistory(['/']);
+    setHistoryIndex(0);
+
+    // Only clear console messages when projectId actually changes (not on initial mount)
+    if (prevProjectIdRef.current && prevProjectIdRef.current !== projectId) {
+      clearErrors();
+    }
+    prevProjectIdRef.current = projectId;
+  }, [projectId, clearErrors]);
+
+  useEffect(() => {
+    checkForBuiltProject();
+  }, [checkForBuiltProject]);
+
+  // Listen for build completion events to refresh the iframe
+  useEffect(() => {
+    const handleBuildComplete = (event: CustomEvent) => {
+      if (event.detail?.projectId === projectId) {
+        console.log('Build completed for project, refreshing preview');
+        // Check for built project and refresh iframe
+        checkForBuiltProject();
+        refreshIframe();
+      }
+    };
+
+    window.addEventListener('buildComplete', handleBuildComplete as EventListener);
+    return () => window.removeEventListener('buildComplete', handleBuildComplete as EventListener);
+  }, [projectId, checkForBuiltProject, refreshIframe]);
+
+  const handleFileSelect = (filePath: string) => {
+    setSelectedFile(filePath);
+    if (isMobile) {
+      setMobileCodeView('editor');
+    }
+  };
+
+  const handleFileSave = async (content: string) => {
+    if (!selectedFile) return;
+
+    try {
+      await fs.writeFile(`${projectsPath}/${projectId}/${selectedFile}`, content);
+      setFileContent(content);
+
+      // Automatically trigger a rebuild after saving a file
+      if (isPreviewable) {
+        console.log('File saved, triggering rebuild...');
+        buildProject(undefined, {
+          onError: (error) => {
+            console.error('Build failed:', error);
+          }
+        });
+      }
+    } catch (error) {
+      console.error('Failed to save file:', error);
+    }
+  };
+
+  const [copiedMessageIndex, setCopiedMessageIndex] = useState<number | null>(null);
+  const [copiedAll, setCopiedAll] = useState(false);
+  const [copiedBuildError, setCopiedBuildError] = useState(false);
+
+  const messages = isLogsOpen ? getConsoleMessages() : [];
+
+  const copyMessageToClipboard = async (msg: ConsoleMessage, index: number) => {
+    try {
+      await navigator.clipboard.writeText(msg.message);
+      setCopiedMessageIndex(index);
+      setTimeout(() => setCopiedMessageIndex(null), 2000);
+    } catch (error) {
+      console.error('Failed to copy message to clipboard:', error);
+    }
+  };
+
+  const copyAllMessagesToClipboard = async () => {
+    try {
+      const allMessages = messages.map(msg => msg.message).join('\n');
+      await navigator.clipboard.writeText(allMessages);
+      setCopiedAll(true);
+      setTimeout(() => setCopiedAll(false), 2000);
+    } catch (error) {
+      console.error('Failed to copy all messages to clipboard:', error);
+    }
+  };
+
+  const messageCount = messages.length;
+
+  // Programmatically resize panels when isLogsOpen changes
+  useEffect(() => {
+    if (isLogsOpen) {
+      // Open logs panel to 40% and resize iframe to 60%
+      logsPanelRef.current?.resize(40);
+      iframePanelRef.current?.resize(60);
+    } else {
+      // Close logs panel and expand iframe to 100%
+      logsPanelRef.current?.resize(0);
+      iframePanelRef.current?.resize(100);
+    }
+  }, [isLogsOpen]);
+
+  return (
+    <div className="h-full">
+      <Tabs value={activeTab} className="h-full">
+        {isPreviewable && (
+          <TabsContent value="preview" className="h-full mt-0">
+            <div
+              ref={previewContainerRef}
+              className={cn(
+                "h-full w-full flex flex-col relative",
+                isFullscreen && "fixed inset-0 z-[100] bg-background"
+              )}
+            >
+              {/* Top navigation bar */}
+              <div className="h-12 flex items-center gap-2 p-2 border-b bg-background w-full">
+                {/* Left side - fullscreen toggle */}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={toggleFullscreen}
+                  className="h-8 w-8 p-0"
+                  title={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+                >
+                  {isFullscreen ? (
+                    <Shrink className="h-4 w-4" />
+                  ) : (
+                    <Expand className="h-4 w-4" />
+                  )}
+                </Button>
+
+                {/* Center - address bar with device toggle */}
+                <div className="flex-1 px-6">
+                  <div className="relative max-w-64 mx-auto">
+                    <BrowserAddressBar
+                      currentPath={currentPath}
+                      onNavigate={hasBuiltProject ? navigateIframe : undefined}
+                      onRefresh={hasBuiltProject ? refreshIframe : undefined}
+                      navigationHistory={navigationHistory}
+                      deviceMode={deviceMode}
+                      onDeviceModeChange={setDeviceMode}
+                    />
+                  </div>
+                </div>
+
+                {/* Right side - actions */}
+                <div className="flex items-center gap-1">
+                  {/* Build button */}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => buildProject(undefined, {
+                      onError: (error) => {
+                        console.error('Build failed:', error);
+                      }
+                    })}
+                    disabled={isBuildLoading}
+                    className="h-8 gap-2"
+                    title={t('buildButtonTooltip')}
+                  >
+                    {isBuildLoading ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Hammer className="h-4 w-4" />
+                    )}
+                    <span className="hidden lg:inline">Build</span>
+                  </Button>
+                  {(!isMobile && onToggleView && isPreviewable) && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={onToggleView}
+                      className="h-8 gap-2"
+                      title={t('codeButtonTooltip')}
+                    >
+                      <Code className="h-4 w-4" />
+                      <span className="hidden lg:inline">Code</span>
+                    </Button>
+                  )}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setIsLogsOpen(!isLogsOpen)}
+                    className={cn("h-8 gap-2 relative", isLogsOpen && "bg-muted")}
+                    title={t('logsButtonTooltip')}
+                  >
+                    <Bug className="h-4 w-4" />
+                    <span className="hidden lg:inline">Logs</span>
+                    {hasConsoleErrors && (
+                      <span className="absolute -top-1 -right-1 h-3 w-3 rounded-full border-2 border-background bg-red-500" />
+                    )}
+                  </Button>
+                </div>
+              </div>
+
+              {/* Content area */}
+              <div className="flex-1 bg-muted/30 min-h-0 overflow-hidden">
+                <ResizablePanelGroup direction="vertical" className="h-full">
+                  <ResizablePanel 
+                    ref={iframePanelRef}
+                    defaultSize={isLogsOpen ? 60 : 100} 
+                    minSize={30} 
+                    className="min-h-0"
+                  >
+                    <div className="h-full flex items-center justify-center min-h-0">
+                      {hasBuiltProject ? (
+                        <div
+                          className={cn(
+                            "h-full relative transition-all duration-300 ease-in-out bg-background",
+                            deviceMode === 'laptop' && "w-full",
+                            deviceMode === 'tablet' && "w-full max-w-3xl shadow-lg",
+                            deviceMode === 'phone' && "w-full max-w-sm shadow-lg"
+                          )}
+                        >
+                          {isStaticPreview ? (
+                            <iframe
+                              key={`static:${projectId}:${iframeReloadKey}`}
+                              ref={iframeRef}
+                              srcDoc={staticSrcDoc}
+                              sandbox="allow-scripts allow-forms allow-modals allow-popups"
+                              className="w-full h-full border-0 bg-background"
+                              title="Static Sandboxed Project Preview"
+                            />
+                          ) : (
+                            <iframe
+                              key={`${projectId}:${user?.pubkey}:${iframeReloadKey}`}
+                              ref={iframeRef}
+                              src={`${previewOrigin}/`}
+                              className="w-full h-full border-0"
+                              title="Project Preview"
+                              allow="microphone; camera; display-capture; geolocation; clipboard-read; clipboard-write; encrypted-media; fullscreen; autoplay; midi; accelerometer; gyroscope; magnetometer; ambient-light-sensor; payment; usb; xr-spatial-tracking"
+                            />
+                          )}
+                          {signerRpc.pendingPrompt && (
+                            <PreviewPermissionPrompt
+                              key={signerRpc.pendingPrompt.id}
+                              prompt={signerRpc.pendingPrompt}
+                              onResolve={signerRpc.resolvePrompt}
+                            />
+                          )}
+                        </div>
+                      ) : (
+                        <div className="h-full w-full flex items-center justify-center bg-muted p-4">
+                          <div className="text-center space-y-4 max-w-2xl w-full">
+                            <div>
+                              <h3 className="text-lg font-semibold mb-2">{t('projectPreview')}</h3>
+                              <p className="text-muted-foreground">
+                                {t('buildProjectToSeePreview')}
+                              </p>
+                            </div>
+                            {buildError && (
+                              <div className="bg-destructive/10 border border-destructive/20 rounded-lg overflow-hidden text-left">
+                                <div className="px-4 py-2 bg-destructive/20 border-b border-destructive/20 flex items-center justify-between">
+                                  <p className="font-semibold text-destructive text-sm">Build Failed</p>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={async () => {
+                                      try {
+                                        await navigator.clipboard.writeText(buildError);
+                                        setCopiedBuildError(true);
+                                        setTimeout(() => setCopiedBuildError(false), 2000);
+                                      } catch (error) {
+                                        console.error('Failed to copy error to clipboard:', error);
+                                      }
+                                    }}
+                                    className="h-7 px-2 text-xs hover:bg-destructive/10"
+                                  >
+                                    {copiedBuildError ? (
+                                      <>
+                                        <Check className="h-3 w-3 mr-1.5" />
+                                        Copied
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Copy className="h-3 w-3 mr-1.5" />
+                                        Copy
+                                      </>
+                                    )}
+                                  </Button>
+                                </div>
+                                <ScrollArea className="max-h-48">
+                                  <div className="overflow-x-auto">
+                                    <pre className="p-4 text-xs font-mono text-destructive whitespace-pre leading-relaxed">{buildError}</pre>
+                                  </div>
+                                  <ScrollBar orientation="horizontal" />
+                                </ScrollArea>
+                              </div>
+                            )}
+                            <Button
+                              variant="outline"
+                              onClick={() => {
+                                setBuildError(null);
+                                buildProject(undefined, {
+                                  onSuccess: () => {
+                                    setBuildError(null);
+                                  },
+                                  onError: (error) => {
+                                    console.error('Build failed:', error);
+                                    setBuildError(error instanceof Error ? error.message : String(error));
+                                  }
+                                });
+                              }}
+                              disabled={isBuildLoading}
+                              className="gap-2"
+                            >
+                              {isBuildLoading ? (
+                                <>
+                                  <Loader2 className="h-4 w-4 animate-spin" />
+                                  Building...
+                                </>
+                              ) : buildError ? (
+                                <>
+                                  <RefreshCw className="h-4 w-4" />
+                                  Retry
+                                </>
+                              ) : (
+                                <>
+                                  <Hammer className="h-4 w-4" />
+                                  Build
+                                </>
+                              )}
+                            </Button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </ResizablePanel>
+                  <ResizableHandle withHandle className={cn(!isLogsOpen && "hidden")} />
+                  <ResizablePanel 
+                    ref={logsPanelRef}
+                    defaultSize={isLogsOpen ? 40 : 0} 
+                    minSize={0} 
+                    maxSize={isLogsOpen ? undefined : 0}
+                    className="min-h-0 min-w-0"
+                    collapsible
+                    collapsedSize={0}
+                  >
+                    {/* Logs Panel */}
+                    <div className="h-full flex flex-col bg-background border-t overflow-hidden min-h-0 w-full min-w-0">
+                      {/* Logs Header */}
+                      <div className="h-12 px-4 border-b flex items-center justify-between flex-shrink-0">
+                        <div className="flex items-center gap-2">
+                          {hasConsoleErrors && (
+                            <span className="h-2 w-2 rounded-full bg-red-500" />
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {messageCount > 0 && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={copyAllMessagesToClipboard}
+                              className="h-7 px-2 text-xs"
+                            >
+                              {copiedAll ? (
+                                <>
+                                  <Check className="h-3 w-3 mr-1.5 text-success" />
+                                  {t('copied')}
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="h-3 w-3 mr-1.5" />
+                                  {t('copyAll')}
+                                </>
+                              )}
+                            </Button>
+                          )}
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setIsLogsOpen(false)}
+                            className="h-7 w-7 p-0"
+                          >
+                            <X className="h-4 w-4" />
+                          </Button>
+                        </div>
+                      </div>
+                      {/* Logs Content */}
+                      <div className="flex-1 min-h-0 overflow-hidden w-full">
+                        <ScrollArea className="h-full w-full">
+                          <div className="p-2 space-y-0 w-full min-w-0 max-w-full">
+                            {messageCount === 0 ? (
+                              <div className="flex flex-col items-center justify-center py-12 text-center">
+                                <p className="text-sm text-muted-foreground font-medium">No console messages</p>
+                                <p className="text-xs text-muted-foreground mt-1">Messages from your project will appear here</p>
+                              </div>
+                            ) : (
+                              messages.map((msg, index) => (
+                                <div
+                                  key={index}
+                                  className="group relative py-0.5 px-1 hover:bg-muted/50 transition-colors duration-150 rounded cursor-pointer w-full max-w-full"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    copyMessageToClipboard(msg, index);
+                                  }}
+                                >
+                                  <div 
+                                    className={cn(
+                                      "text-xs font-mono leading-tight whitespace-pre-wrap break-words w-full min-w-0 max-w-full",
+                                      msg.level === 'error' ? "text-destructive" :
+                                        msg.level === 'warn' ? "text-warning" :
+                                          msg.level === 'info' ? "text-primary" :
+                                            "text-muted-foreground"
+                                    )}
+                                    style={{ wordBreak: 'break-word', overflowWrap: 'break-word' }}
+                                  >
+                                    {msg.message}
+                                  </div>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={(e) => {
+                                      e.preventDefault();
+                                      e.stopPropagation();
+                                      copyMessageToClipboard(msg, index);
+                                    }}
+                                    className="h-3 w-3 p-0 opacity-0 group-hover:opacity-100 transition-all duration-200 absolute right-1 top-1 hover:bg-muted/70 text-muted-foreground hover:text-foreground bg-background/80 rounded border"
+                                  >
+                                    {copiedMessageIndex === index ? (
+                                      <Check className="h-2 w-2 text-success" />
+                                    ) : (
+                                      <Copy className="h-2 w-2" />
+                                    )}
+                                  </Button>
+                                </div>
+                              ))
+                            )}
+                          </div>
+                        </ScrollArea>
+                      </div>
+                    </div>
+                  </ResizablePanel>
+                </ResizablePanelGroup>
+              </div>
+
+              {/* Build loading overlay */}
+              {isBuildLoading && (
+                <div className="absolute inset-0 bg-background/50 backdrop-blur-sm flex items-center justify-center z-10">
+                  <div className="bg-background/90 border rounded-lg p-4 shadow-lg flex items-center gap-3">
+                    <Loader2 className="h-5 w-5 animate-spin text-primary" />
+                    <div className="flex flex-col">
+                      <span className="text-sm font-medium">Building project...</span>
+                      <span className="text-xs text-muted-foreground">Preview will update automatically</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </TabsContent>
+        )}
+
+        <TabsContent value="code" className="h-full mt-0">
+          {isMobile ? (
+            <div className="h-full flex flex-col min-h-0">
+              {/* Mobile Code view header */}
+              <div className="h-12 px-4 border-b flex items-center bg-background flex-shrink-0">
+                <BranchSwitcher projectId={projectId} />
+                <div className="flex-1" />
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setMobileCodeView(mobileCodeView === 'terminal' ? 'explorer' : 'terminal')}
+                  className="gap-2 text-muted-foreground hover:text-foreground"
+                >
+                  <Terminal className="h-4 w-4" />
+                  <span className="hidden sm:inline">Terminal</span>
+                </Button>
+                <GitStatusIndicator projectId={projectId} />
+              </div>
+
+              {mobileCodeView === 'explorer' ? (
+                <div className="flex-1 min-h-0">
+                  <ScrollArea className="h-full">
+                    <ScrollBar orientation="horizontal" />
+                    <div className="min-w-max">
+                      <FileTree
+                        projectId={projectId}
+                        onFileSelect={handleFileSelect}
+                        selectedFile={selectedFile}
+                      />
+                    </div>
+                  </ScrollArea>
+                </div>
+              ) : mobileCodeView === 'terminal' ? (
+                <div className="flex-1 min-h-0">
+                  <TerminalComponent cwd={`${projectsPath}/${projectId}`} />
+                </div>
+              ) : (
+                <>
+                  <div className="p-3 border-b bg-muted/40 flex items-center gap-2">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setMobileCodeView('explorer')}
+                      className="p-1"
+                    >
+                      <ArrowLeft className="h-4 w-4" />
+                    </Button>
+                    <h3 className="font-semibold flex-1 truncate text-brand">
+                      {selectedFile ? selectedFile.split('/').pop() : t('fileEditor')}
+                    </h3>
+                    <GitStatusIndicator projectId={projectId} />
+                  </div>
+                  <div className="flex-1">
+                    {selectedFile ? (
+                      <FileEditor
+                        filePath={selectedFile}
+                        content={fileContent}
+                        onSave={handleFileSave}
+                        isLoading={isLoading}
+                        projectId={projectId}
+                      />
+                    ) : (
+                      <div className="h-full flex items-center justify-center">
+                        <div className="text-center">
+                          <FolderOpen className="h-12 w-12 mx-auto text-muted-foreground mb-4" />
+                          <p className="text-muted-foreground">
+                            {t('selectFileFromExplorer')}
+                          </p>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setMobileCodeView('explorer')}
+                            className="mt-4"
+                          >
+                            {t('openFileExplorer')}
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          ) : (
+            <div className="h-full flex flex-col">
+              {/* Code view header with back button */}
+              {!isMobile && onToggleView && isPreviewable && (
+                <div className="h-12 px-4 border-b flex items-center bg-background gap-3">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={onToggleView}
+                    className="gap-2 text-muted-foreground hover:text-foreground"
+                  >
+                    <ArrowLeft className="h-4 w-4" />
+                    {t('backToPreview')}
+                  </Button>
+                  <div className="flex-1" />
+                  <BranchSwitcher projectId={projectId} />
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setDesktopCodeView(desktopCodeView === 'terminal' ? 'files' : 'terminal')}
+                    className="gap-2 text-muted-foreground hover:text-foreground"
+                  >
+                    <Terminal className="h-4 w-4" />
+                    <span className="hidden lg:inline">Terminal</span>
+                  </Button>
+                  <GitStatusIndicator projectId={projectId} />
+                </div>
+              )}
+              {/* Code view header without back button for non-previewable projects */}
+              {!isMobile && !isPreviewable && (
+                <div className="h-12 px-4 border-b flex items-center bg-background">
+                  <div className="flex-1" />
+                  <BranchSwitcher projectId={projectId} />
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setDesktopCodeView(desktopCodeView === 'terminal' ? 'files' : 'terminal')}
+                    className="gap-2 text-muted-foreground hover:text-foreground"
+                  >
+                    <Terminal className="h-4 w-4" />
+                    <span className="hidden lg:inline">Terminal</span>
+                  </Button>
+                  <GitStatusIndicator projectId={projectId} />
+                </div>
+              )}
+
+              <div className="flex-1 flex min-h-0">
+                {desktopCodeView === 'terminal' ? (
+                  <div className="flex-1">
+                    <TerminalComponent cwd={`${projectsPath}/${projectId}`} />
+                  </div>
+                ) : (
+                  <>
+                    <div className="w-1/3 border-r flex flex-col">
+                      <ScrollArea className="flex-1">
+                        <ScrollBar orientation="horizontal" />
+                        <div className="min-w-max">
+                          <FileTree
+                            projectId={projectId}
+                            onFileSelect={handleFileSelect}
+                            selectedFile={selectedFile}
+                          />
+                        </div>
+                      </ScrollArea>
+                    </div>
+
+                    <div className="flex-1">
+                      {selectedFile ? (
+                        <FileEditor
+                          filePath={selectedFile}
+                          content={fileContent}
+                          onSave={handleFileSave}
+                          isLoading={isLoading}
+                          projectId={projectId}
+                        />
+                      ) : (
+                        <div className="h-full flex items-center justify-center">
+                          <div className="text-center">
+                            <p className="text-muted-foreground">
+                              {t('selectFileFromExplorer')}
+                            </p>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+        </TabsContent>
+      </Tabs>
+    </div>
+  );
+}

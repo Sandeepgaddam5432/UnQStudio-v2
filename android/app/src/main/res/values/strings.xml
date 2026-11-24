@@ -1,0 +1,4 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <!-- Overridden dynamically at build time via Gradle resValue from APP_NAME / APP_ID -->
+</resources>

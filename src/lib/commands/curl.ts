@@ -1,0 +1,454 @@
+import { join } from "path-browserify";
+import type { JSRuntimeFS } from "../JSRuntime";
+import type { ShellCommand, ShellCommandResult } from "./ShellCommand";
+import { createSuccessResult, createErrorResult, toLatin1 } from "./ShellCommand";
+import { isAbsolutePath, validateWritePath } from "../security";
+import { proxyUrl } from "../proxyUrl";
+
+/**
+ * Parsed curl options
+ */
+interface CurlOptions {
+  url?: string;
+  method: string;
+  headers: Record<string, string>;
+  data?: string;
+  output?: string;
+  remoteName?: boolean;
+  includeHeaders: boolean;
+  followRedirects: boolean;
+  silent: boolean;
+  showError: boolean;
+  verbose: boolean;
+  userAgent?: string;
+  timeout?: number;
+  maxRedirects: number;
+  showProgress: boolean;
+  writeOut?: string;
+}
+
+/**
+ * Implementation of the 'curl' command
+ * Transfer data from or to a server using HTTP/HTTPS
+ */
+export class CurlCommand implements ShellCommand {
+  name = 'curl';
+  description = 'Transfer data from or to a server using HTTP/HTTPS';
+  usage = 'curl [options] <url>';
+
+  private fs: JSRuntimeFS;
+  private corsProxy: string;
+
+  constructor(fs: JSRuntimeFS, corsProxy: string) {
+    this.fs = fs;
+    this.corsProxy = corsProxy;
+  }
+
+  async execute(args: string[], cwd: string, _input?: string): Promise<ShellCommandResult> {
+    try {
+      const options = this.parseOptions(args);
+
+      if (!options.url) {
+        return createErrorResult(`${this.name}: no URL specified\nUsage: ${this.usage}`);
+      }
+
+      // Validate URL
+      let url: URL;
+      try {
+        url = new URL(options.url);
+      } catch {
+        return createErrorResult(`${this.name}: invalid URL: ${options.url}`);
+      }
+
+      // Only allow HTTP and HTTPS protocols
+      if (!['http:', 'https:'].includes(url.protocol)) {
+        return createErrorResult(`${this.name}: unsupported protocol: ${url.protocol}`);
+      }
+
+      // Proxy the URL through configured CorsProxy
+      const originalUrl = url.toString();
+      const proxiedUrl = proxyUrl({ template: this.corsProxy, url: originalUrl });
+
+      // Prepare request
+      const requestInit: RequestInit = {
+        method: options.method,
+        headers: options.headers,
+      };
+
+      // Add body for POST, PUT, PATCH requests
+      if (options.data && ['POST', 'PUT', 'PATCH'].includes(options.method)) {
+        requestInit.body = options.data;
+
+        // Set default content-type if not specified
+        if (!options.headers['content-type'] && !options.headers['Content-Type']) {
+          options.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+        }
+      }
+
+      // Set User-Agent
+      if (options.userAgent) {
+        options.headers['User-Agent'] = options.userAgent;
+      } else if (!options.headers['user-agent'] && !options.headers['User-Agent']) {
+        options.headers['User-Agent'] = 'curl/8.0.0 (compatible; JavaScript fetch)';
+      }
+
+      // Handle timeout
+      const controller = new AbortController();
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+      if (options.timeout) {
+        timeoutId = setTimeout(() => controller.abort('Request timeout'), options.timeout * 1000);
+        requestInit.signal = controller.signal;
+      }
+
+      try {
+        if (options.verbose && !options.silent) {
+          console.log(`* Trying ${url.hostname}... (via CorsProxy)`);
+          console.log(`> ${options.method} ${url.pathname}${url.search} HTTP/1.1`);
+          console.log(`> Host: ${url.hostname}`);
+          for (const [key, value] of Object.entries(options.headers)) {
+            console.log(`> ${key}: ${value}`);
+          }
+          if (options.data) {
+            console.log(`> `);
+            console.log(options.data);
+          }
+        }
+
+        // Make the request using the proxied URL
+        const response = await fetch(proxiedUrl, requestInit);
+
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+
+        // Handle redirects manually if followRedirects is false
+        if (!options.followRedirects && response.redirected) {
+          return createErrorResult(`${this.name}: redirect not followed (use -L to follow redirects)`);
+        }
+
+        let output = '';
+
+        // Include response headers if requested
+        if (options.includeHeaders) {
+          output += `HTTP/1.1 ${response.status} ${response.statusText}\n`;
+          response.headers.forEach((value, key) => {
+            output += `${key}: ${value}\n`;
+          });
+          output += '\n';
+        }
+
+        // Get response body. It stays as bytes unless it is valid UTF-8 text.
+        const body = new Uint8Array(await response.arrayBuffer());
+        const responseText = decodeUtf8(body);
+
+        if (options.verbose && !options.silent) {
+          console.log(`< HTTP/1.1 ${response.status} ${response.statusText}`);
+          response.headers.forEach((value, key) => {
+            console.log(`< ${key}: ${value}`);
+          });
+        }
+
+        // Handle non-success status codes
+        if (!response.ok) {
+          const shouldShowError = !options.silent || options.showError;
+          const errorMsg = `HTTP ${response.status}: ${response.statusText}`;
+          if (options.output) {
+            // Still write to file even on error
+            await this.writeToFile(options.output, body, cwd);
+            return shouldShowError ? createErrorResult(errorMsg) : createSuccessResult('');
+          } else {
+            output += responseText ?? new TextDecoder().decode(body);
+            return shouldShowError ? createErrorResult(`${errorMsg}\n${output}`) : createSuccessResult(output);
+          }
+        }
+
+        // Write to file if output option is specified
+        if (options.output) {
+          await this.writeToFile(options.output, body, cwd);
+          if (!options.silent) {
+            return createSuccessResult(`  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current\n                                 Dload  Upload   Total   Spent    Left  Speed\n100  ${body.length}  100  ${body.length}    0     0   ${Math.round(body.length / 0.1)}      0 --:--:-- --:--:-- --:--:--  ${Math.round(body.length / 0.1)}`);
+          } else {
+            return createSuccessResult('');
+          }
+        }
+
+        const writeOut = options.writeOut ? '\n' + this.formatWriteOut(options.writeOut, response, body.length) : '';
+
+        // Binary bodies go to stdout as raw bytes, so `curl url > file` and pipes keep them intact
+        if (responseText === undefined) {
+          const encoder = new TextEncoder();
+          const bytes = toLatin1(encoder.encode(output)) + toLatin1(body) + toLatin1(encoder.encode(writeOut));
+          return { ...createSuccessResult(bytes), stdoutKind: 'bytes' };
+        }
+
+        return createSuccessResult(output + responseText + writeOut);
+
+      } catch (error) {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+
+        const shouldShowError = !options.silent || options.showError;
+        if (!shouldShowError) {
+          return createSuccessResult('');
+        }
+
+        if (error instanceof Error) {
+          if (error.name === 'AbortError') {
+            return createErrorResult(`${this.name}: operation timed out after ${options.timeout} seconds`);
+          } else if (error.message.includes('fetch')) {
+            return createErrorResult(`${this.name}: failed to connect to ${url.hostname}: ${error.message}`);
+          } else {
+            return createErrorResult(`${this.name}: ${error.message}`);
+          }
+        } else {
+          return createErrorResult(`${this.name}: unknown error occurred`);
+        }
+      }
+
+    } catch (error) {
+      return createErrorResult(`${this.name}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Parse curl command line options
+   */
+  private parseOptions(args: string[]): CurlOptions {
+    const options: CurlOptions = {
+      method: 'GET',
+      headers: {},
+      includeHeaders: false,
+      followRedirects: true,
+      silent: false,
+      showError: false,
+      verbose: false,
+      maxRedirects: 50,
+      showProgress: true,
+    };
+
+    args = expandShortOptions(args);
+
+    let i = 0;
+    while (i < args.length) {
+      const arg = args[i];
+
+      if (arg.startsWith('-')) {
+        // Handle options
+        switch (arg) {
+          case '-X':
+          case '--request':
+            i++;
+            if (i < args.length) {
+              options.method = args[i].toUpperCase();
+            }
+            break;
+
+          case '-H':
+          case '--header':
+            i++;
+            if (i < args.length) {
+              const header = args[i];
+              const colonIndex = header.indexOf(':');
+              if (colonIndex > 0) {
+                const key = header.substring(0, colonIndex).trim();
+                const value = header.substring(colonIndex + 1).trim();
+                options.headers[key] = value;
+              }
+            }
+            break;
+
+          case '-d':
+          case '--data':
+          case '--data-raw':
+            i++;
+            if (i < args.length) {
+              options.data = args[i];
+              if (options.method === 'GET') {
+                options.method = 'POST';
+              }
+            }
+            break;
+
+          case '-o':
+          case '--output':
+            i++;
+            if (i < args.length) {
+              options.output = args[i];
+            }
+            break;
+
+          case '-i':
+          case '--include':
+            options.includeHeaders = true;
+            break;
+
+          case '-L':
+          case '--location':
+            options.followRedirects = true;
+            break;
+
+          case '-s':
+          case '--silent':
+            options.silent = true;
+            options.showProgress = false;
+            break;
+
+          case '-S':
+          case '--show-error':
+            options.showError = true;
+            break;
+
+          case '-v':
+          case '--verbose':
+            options.verbose = true;
+            break;
+
+          case '-A':
+          case '--user-agent':
+            i++;
+            if (i < args.length) {
+              options.userAgent = args[i];
+            }
+            break;
+
+          case '-m':
+          case '--max-time':
+            i++;
+            if (i < args.length) {
+              options.timeout = parseInt(args[i], 10);
+            }
+            break;
+
+          case '--max-redirs':
+            i++;
+            if (i < args.length) {
+              options.maxRedirects = parseInt(args[i], 10);
+            }
+            break;
+
+          case '-w':
+          case '--write-out':
+            i++;
+            if (i < args.length) {
+              options.writeOut = args[i];
+            }
+            break;
+
+          case '-O':
+          case '--remote-name':
+            options.remoteName = true;
+            break;
+
+          case '--no-progress-meter':
+            options.showProgress = false;
+            break;
+        }
+      } else {
+        // This should be the URL
+        if (!options.url) {
+          options.url = arg;
+        }
+      }
+
+      i++;
+    }
+
+    // -O names the file after the last segment of the URL path (sanitized against path traversal, fixes F-006)
+    if (options.remoteName && !options.output && options.url) {
+      try {
+        const rawSegment = decodeURIComponent(new URL(options.url).pathname.split('/').pop() || '');
+        const safeName = rawSegment.replace(/[/\\]/g, '').replace(/^\.+$/, '');
+        options.output = safeName && !safeName.includes('..') ? safeName : 'index.html';
+      } catch {
+        // Invalid URLs are reported by execute()
+      }
+    }
+
+    return options;
+  }
+
+  /**
+   * Write response to a file
+   */
+  private async writeToFile(filename: string, content: Uint8Array, cwd: string): Promise<void> {
+    try {
+      // Handle both absolute and relative paths first, then validate resolved canonical path
+      const absolutePath = isAbsolutePath(filename) ? filename : join(cwd, filename);
+      validateWritePath(absolutePath, 'curl', cwd);
+
+      await this.fs.writeFile(absolutePath, content);
+    } catch (error) {
+      throw new Error(`failed to write to file ${filename}: ${error instanceof Error ? error.message : 'unknown error'}`);
+    }
+  }
+
+  /**
+   * Format write-out variables
+   */
+  private formatWriteOut(format: string, response: Response, sizeDownload: number): string {
+    const variables: Record<string, string | number> = {
+      'http_code': response.status,
+      'response_code': response.status,
+      'http_version': '1.1',
+      'size_download': sizeDownload,
+      'size_upload': 0,
+      'time_total': 0.1, // Placeholder since we don't track timing
+      'time_namelookup': 0.01,
+      'time_connect': 0.02,
+      'time_appconnect': 0.03,
+      'time_pretransfer': 0.04,
+      'time_redirect': 0.0,
+      'time_starttransfer': 0.05,
+      'url_effective': response.url,
+      'content_type': response.headers.get('content-type') || '',
+    };
+
+    let result = format;
+
+    // Replace variables
+    for (const [key, value] of Object.entries(variables)) {
+      const regex = new RegExp(`%\\{${key}\\}`, 'g');
+      result = result.replace(regex, String(value));
+    }
+
+    // Handle escape sequences
+    result = result.replace(/\\n/g, '\n');
+    result = result.replace(/\\t/g, '\t');
+    result = result.replace(/\\r/g, '\r');
+    result = result.replace(/\\\\/g, '\\');
+
+    return result;
+  }
+}
+/** Decode a body as UTF-8, or return undefined if it isn't valid UTF-8 (i.e. it's binary). */
+function decodeUtf8(bytes: Uint8Array): string | undefined {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Short options that take a value. */
+const SHORT_OPTIONS_WITH_VALUE = new Set(['X', 'H', 'd', 'o', 'A', 'm', 'w']);
+
+/** Split combined short options, e.g. `-sLo file` into `-s -L -o file`, and `-ofile` into `-o file`. */
+function expandShortOptions(args: string[]): string[] {
+  const result: string[] = [];
+  for (const arg of args) {
+    if (!/^-[^-]./.test(arg)) {
+      result.push(arg);
+      continue;
+    }
+    for (let j = 1; j < arg.length; j++) {
+      result.push('-' + arg[j]);
+      if (SHORT_OPTIONS_WITH_VALUE.has(arg[j])) {
+        if (j + 1 < arg.length) result.push(arg.slice(j + 1));
+        break;
+      }
+    }
+  }
+  return result;
+}

@@ -1,0 +1,258 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { GitCommitTool } from './GitCommitTool';
+import { Git } from '../git';
+import type { JSRuntimeFS } from '../JSRuntime';
+
+// Mock the Git class
+const mockGitInstance = {
+  statusMatrix: vi.fn(),
+  add: vi.fn(),
+  remove: vi.fn(),
+  commit: vi.fn(),
+  currentBranch: vi.fn(),
+  getConfig: vi.fn(),
+};
+
+vi.mock('../git', () => ({
+  Git: vi.fn().mockImplementation(() => mockGitInstance),
+}));
+
+// Mock filesystem
+const mockFS: JSRuntimeFS = {
+  readFile: vi.fn(),
+  writeFile: vi.fn(),
+  readdir: vi.fn(),
+  mkdir: vi.fn(),
+  stat: vi.fn(),
+  lstat: vi.fn(),
+  unlink: vi.fn(),
+  rmdir: vi.fn(),
+  rename: vi.fn(),
+  readlink: vi.fn(),
+  symlink: vi.fn(),
+};
+
+describe('GitCommitTool', () => {
+  let tool: GitCommitTool;
+  let mockGit: Git;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGit = mockGitInstance as unknown as Git;
+    tool = new GitCommitTool(mockFS, '/test/project', mockGit);
+
+    // Setup default mocks
+    mockGitInstance.statusMatrix.mockResolvedValue([
+      ['src/file1.ts', 1, 2, 1], // Modified file (workdir differs from head, not staged)
+      ['src/file2.ts', 0, 2, 0], // New file (absent in head, present in workdir, not staged)
+    ]);
+    mockGitInstance.add.mockResolvedValue(undefined);
+    mockGitInstance.remove.mockResolvedValue(undefined);
+    mockGitInstance.commit.mockResolvedValue('abcd1234567890abcdef1234567890abcdef12');
+    mockGitInstance.currentBranch.mockResolvedValue('main');
+    mockGitInstance.getConfig.mockRejectedValue(new Error('Config not found'));
+  });
+
+  it('should have correct description and inputSchema', () => {
+    expect(tool.description).toContain('Commit changes to git with a commit message. Automatically adds all unstaged files.');
+    expect(tool.inputSchema).toBeDefined();
+  });
+
+  it('should successfully commit changes', async () => {
+    // Mock .git directory exists
+    vi.mocked(mockFS.stat).mockResolvedValue({
+      isDirectory: () => true,
+      isFile: () => false,
+    });
+
+    const result = await tool.execute({ message: 'Add new feature' });
+
+    expect(mockFS.stat).toHaveBeenCalledWith('/test/project/.git');
+    expect(mockGitInstance.statusMatrix).toHaveBeenCalledWith({
+      dir: '/test/project',
+    });
+    expect(mockGitInstance.add).toHaveBeenCalled();
+    expect(mockGitInstance.commit).toHaveBeenCalledWith({
+      dir: '/test/project',
+      message: 'Add new feature',
+    });
+    expect(result.content).toContain('✅ Successfully committed 2 files (abcd123)');
+    expect(result.content).toContain('Add new feature');
+  });
+
+  it('should handle empty commit message', async () => {
+    // Mock .git directory exists
+    vi.mocked(mockFS.stat).mockResolvedValue({
+      isDirectory: () => true,
+      isFile: () => false,
+    });
+
+    await expect(tool.execute({ message: '' })).rejects.toThrow('❌ Commit message cannot be empty');
+  });
+
+  it('should handle whitespace-only commit message', async () => {
+    // Mock .git directory exists
+    vi.mocked(mockFS.stat).mockResolvedValue({
+      isDirectory: () => true,
+      isFile: () => false,
+    });
+
+    await expect(tool.execute({ message: '   ' })).rejects.toThrow('❌ Commit message cannot be empty');
+  });
+
+  it('should handle not being in a git repository', async () => {
+    // Mock .git directory does not exist
+    vi.mocked(mockFS.stat).mockRejectedValue(new Error('File not found'));
+
+    await expect(tool.execute({ message: 'Test commit' })).rejects.toThrow('❌ Not a git repository');
+    expect(mockFS.stat).toHaveBeenCalledWith('/test/project/.git');
+  });
+
+  it('should handle commit with special characters in message', async () => {
+    // Mock .git directory exists
+    vi.mocked(mockFS.stat).mockResolvedValue({
+      isDirectory: () => true,
+      isFile: () => false,
+    });
+
+    const specialMessage = 'Fix: handle "quotes" and \'apostrophes\' in commit message';
+    const result = await tool.execute({ message: specialMessage });
+
+    expect(mockGitInstance.commit).toHaveBeenCalledWith(expect.objectContaining({
+      message: specialMessage,
+    }));
+    expect(result.content).toContain('✅ Successfully committed');
+    expect(result.content).toContain(specialMessage);
+  });
+
+  it('should handle multiline commit message', async () => {
+    // Mock .git directory exists
+    vi.mocked(mockFS.stat).mockResolvedValue({
+      isDirectory: () => true,
+      isFile: () => false,
+    });
+
+    const multilineMessage = 'Add new feature\n\nThis commit adds a new feature that allows users to do something amazing.\n\nCloses #123';
+    const result = await tool.execute({ message: multilineMessage });
+
+    expect(mockGitInstance.commit).toHaveBeenCalled();
+    expect(result.content).toContain('✅ Successfully committed');
+    expect(result.content).toContain('Add new feature');
+  });
+
+  it('should handle no changes to commit', async () => {
+    // Mock .git directory exists
+    vi.mocked(mockFS.stat).mockResolvedValue({
+      isDirectory: () => true,
+      isFile: () => false,
+    });
+
+    // Mock no changes in status matrix
+    vi.mocked(mockGitInstance.statusMatrix).mockResolvedValue([]);
+
+    const result = await tool.execute({ message: 'Update documentation' });
+
+    expect(result.content).toContain('ℹ️ No changes to commit. Working tree is clean.');
+    expect(mockGitInstance.commit).not.toHaveBeenCalled();
+  });
+
+  it('should provide detailed commit information', async () => {
+    // Mock .git directory exists
+    vi.mocked(mockFS.stat).mockResolvedValue({
+      isDirectory: () => true,
+      isFile: () => false,
+    });
+
+    const result = await tool.execute({ message: 'Update documentation' });
+
+    expect(result.content).toContain('📝 Commit: "Update documentation"');
+    expect(result.content).toContain('🔗 Hash:');
+    expect(result.content).toContain('🌿 Branch:');
+    expect(result.content).toContain('📊 Changes:');
+    expect(result.content).toContain('1 file added');
+    expect(result.content).toContain('1 file modified');
+  });
+
+  it('should count deleted files', async () => {
+    vi.mocked(mockFS.stat).mockResolvedValue({
+      isDirectory: () => true,
+      isFile: () => false,
+    });
+    vi.mocked(mockGitInstance.statusMatrix).mockResolvedValue([
+      ['src/old.ts', 1, 0, 1],
+    ]);
+
+    const result = await tool.execute({ message: 'Remove old file' });
+
+    expect(result.content).toContain('1 file deleted');
+  });
+
+
+
+  it('should handle very long commit message', async () => {
+    // Mock .git directory exists
+    vi.mocked(mockFS.stat).mockResolvedValue({
+      isDirectory: () => true,
+      isFile: () => false,
+    });
+
+    const longMessage = 'A'.repeat(1000); // Very long commit message
+    const result = await tool.execute({ message: longMessage });
+
+    expect(result.content).toContain('✅ Successfully committed');
+  });
+
+  it('should error when HEAD is detached (currentBranch returns null)', async () => {
+    // Mock .git directory exists
+    vi.mocked(mockFS.stat).mockResolvedValue({
+      isDirectory: () => true,
+      isFile: () => false,
+    });
+
+    // Mock detached HEAD state - currentBranch returns null
+    vi.mocked(mockGitInstance.currentBranch).mockResolvedValue(null);
+
+    await expect(tool.execute({ message: 'Test commit' })).rejects.toThrow('❌ Cannot commit: Git is in a detached HEAD state');
+
+    // Verify commit was never called
+    expect(mockGitInstance.commit).not.toHaveBeenCalled();
+  });
+
+  it('should error when HEAD is detached (currentBranch returns undefined)', async () => {
+    // Mock .git directory exists
+    vi.mocked(mockFS.stat).mockResolvedValue({
+      isDirectory: () => true,
+      isFile: () => false,
+    });
+
+    // Mock detached HEAD state - currentBranch returns undefined
+    vi.mocked(mockGitInstance.currentBranch).mockResolvedValue(undefined);
+
+    await expect(tool.execute({ message: 'Test commit' })).rejects.toThrow('❌ Cannot commit: Git is in a detached HEAD state');
+
+    // Verify commit was never called
+    expect(mockGitInstance.commit).not.toHaveBeenCalled();
+  });
+
+  it('should provide helpful instructions when HEAD is detached', async () => {
+    // Mock .git directory exists
+    vi.mocked(mockFS.stat).mockResolvedValue({
+      isDirectory: () => true,
+      isFile: () => false,
+    });
+
+    // Mock detached HEAD state
+    vi.mocked(mockGitInstance.currentBranch).mockResolvedValue(null);
+
+    try {
+      await tool.execute({ message: 'Test commit' });
+      expect.fail('Should have thrown an error');
+    } catch (error) {
+      const errorMessage = (error as Error).message;
+      // Verify the error message contains safe instructions that preserve changes
+      expect(errorMessage).toContain('git checkout -b temp-branch');
+      expect(errorMessage).toContain('try the commit again');
+      expect(errorMessage).toContain('preserving all changes');
+    }
+  });
+});

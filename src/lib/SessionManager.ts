@@ -1,0 +1,1223 @@
+import OpenAI from 'openai';
+import type { Decimal } from 'decimal.js';
+import type { JSRuntimeFS } from './JSRuntime';
+import { DotAI, type SystemPromptSnapshot } from './DotAI';
+import { parseProviderModel } from './parseProviderModel';
+import { createAIClient, isOpenRouter } from './ai-client';
+import type { Tool } from './tools/Tool';
+import type { NUser } from '@nostrify/react/login';
+import { DEFAULT_REASONING_EFFORT, type AISettings } from '@/contexts/AISettingsContext';
+import { formatPromptDate, makeSystemPrompt, readDeployedUrl, type PromptEnvironment } from './system';
+import { describeEnvironmentChanges, makeSystemReminder } from './systemReminder';
+import { NostrMetadata } from '@nostrify/nostrify';
+import { MalformedToolCallError } from './errors/MalformedToolCallError';
+import { EmptyMessageError } from './errors/EmptyMessageError';
+import { isEmptyMessage } from './isEmptyMessage';
+import { Git } from './git';
+import type { NPool } from '@nostrify/nostrify';
+import type { AppConfig } from '@/contexts/AppContext';
+import { getSentryInstance } from './sentry';
+import { mergeReasoningDetails, type ReasoningDetail } from './reasoningDetails';
+import { CANCELLED_TOOL_RESULT, repairHistory } from './repairHistory';
+
+export type AIMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam | {
+  role: 'assistant';
+  content: string;
+  reasoning_content?: string;
+  reasoning_details?: ReasoningDetail[];
+  tool_calls?: OpenAI.Chat.Completions.ChatCompletionMessageToolCall[];
+} | {
+  /** A tool result with images. APIs don't accept images in tool results, so they're sent in a user message after it. */
+  role: 'tool';
+  tool_call_id: string;
+  content: Array<OpenAI.Chat.Completions.ChatCompletionContentPartText | OpenAI.Chat.Completions.ChatCompletionContentPartImage>;
+};
+
+/** How many of the most recent tool-result images are always re-sent to the model. */
+const MAX_TOOL_IMAGES = 3;
+
+/**
+ * Older tool images are removed this many at a time, so up to `MAX_TOOL_IMAGES + TOOL_IMAGE_EVICTION_BATCH - 1`
+ * are sent. Removing one per new image would rewrite an earlier message on every turn, which breaks providers'
+ * prompt caches and session resume (Meridian replays the whole conversation when its history changes).
+ */
+const TOOL_IMAGE_EVICTION_BATCH = 5;
+
+/** Whether an API error says the model can't take image input, as opposed to failing for some other reason. */
+export function isImageUnsupportedError(error: unknown): boolean {
+  const errorObj = error as Record<string, unknown> | undefined;
+  const status = typeof errorObj?.status === 'number' ? errorObj.status : undefined;
+  if (status !== 400 && status !== 404 && status !== 500) return false;
+  const message = error instanceof Error ? error.message : JSON.stringify(errorObj?.error ?? errorObj ?? '');
+  return /image|vision|multimodal|modalit/i.test(message);
+}
+
+export type UserMessageContent = string | Array<OpenAI.Chat.Completions.ChatCompletionContentPartText | OpenAI.Chat.Completions.ChatCompletionContentPartImage>;
+
+/** A user message waiting for the current turn to finish. */
+export interface QueuedMessage {
+  id: string;
+  content: UserMessageContent;
+}
+
+export interface SessionState {
+  projectId: string;
+  tools: Record<string, OpenAI.Chat.Completions.ChatCompletionTool>;
+  customTools: Record<string, Tool<unknown>>;
+  maxSteps?: number;
+  messages: AIMessage[];
+  streamingMessage?: {
+    role: 'assistant';
+    content: string;
+    reasoning_content?: string;
+    tool_calls?: OpenAI.Chat.Completions.ChatCompletionMessageToolCall[];
+  };
+  isLoading: boolean;
+  sessionName: string;
+  lastActivity: Date;
+  abortController?: AbortController;
+  totalCost?: number; // Total cost in USD for this session
+  lastInputTokens?: number; // Input tokens from the last AI request
+  imagesNotSupported?: boolean; // Track if this session's model doesn't support images
+  lastFinishReason?: string | null; // Last finish reason from AI generation
+  queuedMessages: QueuedMessage[]; // Sent while the AI was working; added once its turn ends
+  systemPrompt?: SystemPromptSnapshot; // Rendered once per session so prompt caching keeps working
+}
+
+export interface SessionManagerEvents {
+  sessionCreated: (projectId: string) => void;
+  sessionDeleted: (projectId: string) => void;
+  messageAdded: (projectId: string, message: AIMessage) => void;
+  /** The history was rewritten (repaired), so listeners should replace their copy */
+  messagesReplaced: (projectId: string, messages: AIMessage[]) => void;
+  streamingUpdate: (projectId: string, content: string, reasoningContent?: string, toolCalls?: OpenAI.Chat.Completions.ChatCompletionMessageToolCall[]) => void;
+  loadingChanged: (projectId: string, isLoading: boolean) => void;
+  costUpdated: (projectId: string, totalCost: number) => void;
+  contextUsageUpdated: (projectId: string, inputTokens: number) => void;
+  fileChanged: (projectId: string, filePath: string) => void;
+  finishReasonChanged: (projectId: string, finishReason: string | null) => void;
+  queueChanged: (projectId: string, queuedMessages: QueuedMessage[]) => void;
+}
+
+/**
+ * Global session manager that handles AI chat sessions keyed by project ID.
+ * Only one session can be active per project at once.
+ */
+export class SessionManager {
+  private sessions = new Map<string, SessionState>();
+  private queueWrites = new Map<string, Promise<void>>();
+  private listeners: Partial<Record<keyof SessionManagerEvents, Set<(...args: unknown[]) => void>>> = {};
+  private fs: JSRuntimeFS;
+  private nostr: NPool;
+  private getSettings: () => Pick<AISettings, 'providers' | 'imageModel' | 'reasoningEffort'>;
+  private getConfig: () => AppConfig;
+  private getDefaultConfig: () => AppConfig;
+  private getProviderModels?: () => Array<{ id: string; provider: string; contextLength?: number; pricing?: { prompt: Decimal; completion: Decimal } }>;
+  private getCurrentUser?: () => { user?: NUser; metadata?: NostrMetadata };
+
+  constructor(
+    fs: JSRuntimeFS,
+    nostr: NPool,
+    getSettings: () => Pick<AISettings, 'providers' | 'imageModel' | 'reasoningEffort'>,
+    getConfig: () => AppConfig,
+    getDefaultConfig: () => AppConfig,
+    getProviderModels?: () => Array<{ id: string; provider: string; contextLength?: number; pricing?: { prompt: Decimal; completion: Decimal } }>,
+    getCurrentUser?: () => { user?: NUser; metadata?: NostrMetadata },
+  ) {
+    this.fs = fs;
+    this.nostr = nostr;
+    this.getSettings = getSettings;
+    this.getConfig = getConfig;
+    this.getDefaultConfig = getDefaultConfig;
+    this.getProviderModels = getProviderModels;
+    this.getCurrentUser = getCurrentUser;
+  }
+
+  private get git(): Git {
+    const config = this.getConfig();
+    return new Git({ fs: this.fs, nostr: this.nostr, corsProxy: config.corsProxy });
+  }
+
+  /**
+   * Create a new session for a project
+   */
+  async loadSession(
+    projectId: string,
+    tools: Record<string, OpenAI.Chat.Completions.ChatCompletionTool>,
+    customTools: Record<string, Tool<unknown>>,
+    maxSteps?: number
+  ): Promise<SessionState> {
+    let messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
+    let sessionName = DotAI.generateSessionName();
+    let lastFinishReason: string | null | undefined;
+    let queuedMessages: QueuedMessage[] = [];
+    let historyRepaired = false;
+
+    // Try to load existing history
+    try {
+      const config = this.getConfig();
+      const dotAI = new DotAI(this.fs, `${config.fsPathProjects}/${projectId}`);
+      const lastSession = await dotAI.readLastSessionHistory();
+      if (lastSession) {
+        // Tool calls left without a result can only still be running if this session is mid-turn;
+        // otherwise they were cut off (e.g. by a reload) and are answered so the history can be sent.
+        const running = this.sessions.get(projectId)?.isLoading ?? false;
+        const repaired = repairHistory(lastSession.messages as AIMessage[], { closeTrailing: !running });
+        messages = repaired.messages as OpenAI.Chat.Completions.ChatCompletionMessageParam[];
+        sessionName = lastSession.sessionName;
+        historyRepaired = repaired.repaired;
+      }
+
+      // Load last finish reason
+      lastFinishReason = await dotAI.readFinishReason();
+
+      // Load messages queued before a reload
+      queuedMessages = await dotAI.readQueue();
+    } catch (error) {
+      console.warn('Failed to load session history:', error);
+    }
+
+    const session = this.sessions.get(projectId) ?? {
+      projectId,
+      tools,
+      customTools,
+      maxSteps,
+      isLoading: false,
+      lastActivity: new Date(),
+      totalCost: 0,
+      lastInputTokens: 0,
+      lastFinishReason,
+      queuedMessages,
+      ...this.sessions.get(projectId),
+      messages,
+      sessionName,
+      systemPrompt: undefined, // Read from the loaded session's own snapshot on the next request
+    };
+
+    // Update session configuration
+    session.projectId = projectId;
+    session.tools = tools;
+
+    session.customTools = customTools;
+    session.maxSteps = maxSteps;
+
+    this.sessions.set(projectId, session);
+
+    if (historyRepaired) {
+      await this.saveSessionHistory(projectId);
+    }
+
+    this.emit('sessionCreated', projectId);
+
+    return session;
+  }
+
+  /**
+   * Get a session by project ID
+   */
+  getSession(projectId: string): SessionState | undefined {
+    return this.sessions.get(projectId);
+  }
+
+  /**
+   * Get all active sessions
+   */
+  getAllSessions(): SessionState[] {
+    return Array.from(this.sessions.values());
+  }
+
+  /**
+   * Delete a session
+   */
+  async deleteSession(projectId: string): Promise<void> {
+    const session = this.sessions.get(projectId);
+    session?.abortController?.abort('Session deleted');
+
+    this.sessions.delete(projectId);
+
+    this.emit('sessionDeleted', projectId);
+  }
+
+  /**
+   * Add a message to a session
+   */
+  async addMessage(projectId: string, message: AIMessage): Promise<void> {
+    const session = this.sessions.get(projectId);
+    if (!session) return;
+
+    session.messages.push(message);
+    session.lastActivity = new Date();
+
+    await this.saveSessionHistory(projectId);
+    this.emit('messageAdded', projectId, message);
+  }
+
+  /**
+   * Send a message and start AI generation.
+   * If the AI is already working, the message is queued until its turn ends.
+   */
+  async sendMessage(
+    projectId: string,
+    content: UserMessageContent,
+    providerModel: string
+  ): Promise<void> {
+    const session = this.sessions.get(projectId);
+    if (!session) return;
+
+    if (session.isLoading) {
+      this.queueMessage(projectId, content);
+      return;
+    }
+
+    // Messages left over from a turn that was stopped go first, in the order they were written.
+    await this.flushQueue(projectId);
+    await this.addMessage(projectId, { role: 'user', content });
+    await this.startGeneration(projectId, providerModel);
+  }
+
+  /**
+   * Queue a user message to be added once the current turn ends
+   */
+  queueMessage(projectId: string, content: UserMessageContent): void {
+    const session = this.sessions.get(projectId);
+    if (!session) return;
+
+    this.setQueue(projectId, [...session.queuedMessages, { id: crypto.randomUUID(), content }]);
+  }
+
+  /**
+   * Remove a queued message before it is sent
+   */
+  removeQueuedMessage(projectId: string, id: string): void {
+    const session = this.sessions.get(projectId);
+    if (!session) return;
+
+    this.setQueue(projectId, session.queuedMessages.filter((message) => message.id !== id));
+  }
+
+  /**
+   * Replace a session's queue, notify listeners, and save it
+   */
+  private setQueue(projectId: string, queue: QueuedMessage[]): void {
+    const session = this.sessions.get(projectId);
+    if (!session) return;
+
+    session.queuedMessages = queue;
+    this.emit('queueChanged', projectId, queue);
+
+    // Chain writes so they land in order; recover on error so queue writes never poison permanently (fixes F-011)
+    const config = this.getConfig();
+    const dotAI = new DotAI(this.fs, `${config.fsPathProjects}/${projectId}`);
+    const previous = this.queueWrites.get(projectId) ?? Promise.resolve();
+    const write = previous
+      .then(() => dotAI.writeQueue(this.sessions.get(projectId)?.queuedMessages ?? []))
+      .catch((error) => {
+        console.error('Failed to persist queued messages:', error);
+      });
+    this.queueWrites.set(projectId, write);
+  }
+
+  /**
+   * Add all queued messages to the conversation. Returns whether there were any.
+   */
+  private async flushQueue(projectId: string): Promise<boolean> {
+    const session = this.sessions.get(projectId);
+    if (!session || session.queuedMessages.length === 0) return false;
+
+    const queued = session.queuedMessages;
+    for (const { content } of queued) {
+      await this.addMessage(projectId, { role: 'user', content });
+    }
+
+    // Cleared after the messages are in the history, so a reload in between can't lose them.
+    // Anything queued meanwhile stays.
+    const flushed = new Set(queued.map(({ id }) => id));
+    this.setQueue(projectId, session.queuedMessages.filter(({ id }) => !flushed.has(id)));
+    return true;
+  }
+
+  /**
+   * Start AI generation for a session
+   */
+  async startGeneration(projectId: string, providerModel: string): Promise<void> {
+    console.log('Starting AI generation for project:', projectId, 'with model:', providerModel);
+    let session = this.sessions.get(projectId);
+
+    if (!session) {
+      throw new Error('Session not found');
+    }
+    if (session.messages.length === 0) {
+      throw new Error('No messages in session');
+    }
+
+    // This turn's controller. Stopping aborts it, and a newer turn replaces it, so a turn checks its
+    // own controller (not `session.isLoading`) to know whether it's still the one that should be running.
+    const controller = new AbortController();
+    const { signal } = controller;
+
+    session.isLoading = true;
+    session.abortController = controller;
+    session.lastActivity = new Date();
+    this.sessions.set(projectId, session);
+
+    this.emit('loadingChanged', projectId, true);
+
+    try {
+      // Get latest config and settings
+      const config = this.getConfig();
+      const defaultConfig = this.getDefaultConfig();
+      const settings = this.getSettings();
+
+      // Parse provider and model
+      const parsed = parseProviderModel(providerModel, settings.providers);
+      const provider = parsed.provider;
+      const model = parsed.model;
+
+      // Initialize OpenAI client
+      const { user, metadata } = this.getCurrentUser?.() ?? {};
+      const openai = createAIClient(provider, user, config.corsProxy);
+
+      let stepCount = 0;
+      const maxSteps = session.maxSteps || 50;
+
+      // Main AI generation loop
+      while (stepCount < maxSteps) {
+        const currentSession = this.sessions.get(projectId);
+        if (!currentSession || signal.aborted) {
+          break;
+        }
+        session = currentSession;
+
+        stepCount++;
+
+        // Initialize streaming message
+        session.streamingMessage = {
+          role: 'assistant',
+          content: '',
+          reasoning_content: '',
+          tool_calls: undefined
+        };
+
+        // Get repository URL if available
+        let repositoryUrl: string | undefined;
+        try {
+          const remoteUrl = await this.git.getRemoteURL(`${config.fsPathProjects}/${projectId}`, 'origin');
+          repositoryUrl = remoteUrl || undefined;
+        } catch {
+          // No repository URL available
+        }
+
+        // Get project template metadata if available
+        let projectTemplate: { name: string; description: string; url: string } | undefined;
+        try {
+          const dotai = new DotAI(this.fs, `${config.fsPathProjects}/${projectId}`);
+          const template = await dotai.readTemplate();
+          projectTemplate = template || undefined;
+        } catch {
+          // Template metadata not available
+        }
+
+        // Build model and provider info objects
+        const modelInfo = {
+          id: model,
+          fullId: providerModel,
+        };
+
+        const providerInfo = {
+          id: provider.id,
+          name: provider.name,
+          baseURL: provider.baseURL,
+        };
+
+        const cwd = `${config.fsPathProjects}/${projectId}`;
+        const settings = this.getSettings();
+        const dotAI = new DotAI(this.fs, cwd);
+
+        const environment: PromptEnvironment = {
+          date: formatPromptDate(),
+          repositoryUrl,
+          deployedUrl: await readDeployedUrl(this.fs, cwd),
+        };
+        const template = config.systemPrompt || null;
+
+        // The system prompt is the start of every request, so any change to it makes the
+        // provider's prompt cache miss for the whole conversation. Render it once per session
+        // (and again only when the model or template changes, which misses the cache anyway),
+        // and report later changes to what it states in a reminder at the end of the history.
+        const snapshot = session.systemPrompt ?? await dotAI.readSystemPrompt(session.sessionName) ?? undefined;
+        if (snapshot && snapshot.model === providerModel && snapshot.template === template) {
+          const changes = describeEnvironmentChanges(snapshot.environment, environment);
+          if (changes) {
+            await this.addMessage(projectId, makeSystemReminder(changes));
+            snapshot.environment = environment;
+            await dotAI.writeSystemPrompt(session.sessionName, snapshot);
+          }
+          session.systemPrompt = snapshot;
+        } else {
+          const commits = await this.git.log({ dir: cwd });
+          const prompt = await makeSystemPrompt({
+            cwd,
+            fs: this.fs,
+            mode: commits.length > 1 ? "agent" : "init",
+            tools: Object.values(session.tools),
+            config,
+            defaultConfig,
+            user,
+            metadata,
+            repositoryUrl,
+            template: config.systemPrompt,
+            projectTemplate,
+            model: modelInfo,
+            provider: providerInfo,
+            imageModel: settings.imageModel,
+          });
+          session.systemPrompt = { prompt, model: providerModel, template, environment };
+          await dotAI.writeSystemPrompt(session.sessionName, session.systemPrompt);
+        }
+        const systemPrompt = session.systemPrompt.prompt;
+
+        // Strip older images returned by tools (e.g. `read` on a PNG). Re-sending every one on
+        // every turn burns tokens, but the model needs the last few to compare versions while it
+        // iterates on visual work. Images the user attached are always kept, since they are often
+        // the reference the whole session works towards. Each removed image is replaced with a
+        // note, so the model knows it saw the image rather than concluding it never got one.
+        // Images are removed in batches (see TOOL_IMAGE_EVICTION_BATCH) to keep the history stable.
+        const evictOldToolImages = (msgs: AIMessage[]): AIMessage[] => {
+          const isToolWithImages = (msg: AIMessage) =>
+            msg.role === 'tool' && Array.isArray(msg.content) && msg.content.some(part => part.type === 'image_url');
+          const total = msgs.reduce((n, msg) =>
+            isToolWithImages(msg) && Array.isArray(msg.content) ? n + msg.content.filter(part => part.type === 'image_url').length : n, 0);
+          const excess = Math.max(0, total - MAX_TOOL_IMAGES);
+          let toEvict = excess - (excess % TOOL_IMAGE_EVICTION_BATCH);
+          if (toEvict === 0) return msgs;
+
+          return msgs.map(msg => {
+            if (toEvict === 0 || !isToolWithImages(msg) || !Array.isArray(msg.content)) return msg;
+            const content = msg.content.map(part => {
+              if (part.type !== 'image_url' || toEvict === 0) return part;
+              toEvict--;
+              return { type: 'text' as const, text: '[Image shown to you earlier, now removed from the context to save tokens. Read the file again to see it.]' };
+            });
+            return { ...msg, content } as AIMessage;
+          });
+        };
+
+        // Helper function to filter out unsupported image formats (keep only JPG/JPEG/PNG)
+        const filterSupportedImages = (msgs: OpenAI.Chat.Completions.ChatCompletionMessageParam[]): OpenAI.Chat.Completions.ChatCompletionMessageParam[] => {
+          return msgs.map(msg => {
+            if (msg.role === 'user' && typeof msg.content !== 'string' && Array.isArray(msg.content)) {
+              const filteredContent = msg.content.filter(part => {
+                if (part.type !== 'image_url') return true;
+
+                const imagePart = part as OpenAI.Chat.Completions.ChatCompletionContentPartImage;
+                const url = imagePart.image_url.url.toLowerCase();
+
+                // Keep only JPG/JPEG/PNG images
+                // Check file extension or data URL MIME type
+                return /\.(jpg|jpeg|png)(\?|$)/.test(url) ||
+                       url.startsWith('data:image/jpeg') ||
+                       url.startsWith('data:image/png') ||
+                       url.startsWith('data:image/jpg');
+              });
+
+              return {
+                ...msg,
+                content: filteredContent
+              };
+            }
+            return msg;
+          });
+        };
+
+        // Helper function to strip all image_url parts but keep text parts (including VFS paths)
+        const stripImageUrls = (msgs: OpenAI.Chat.Completions.ChatCompletionMessageParam[]): OpenAI.Chat.Completions.ChatCompletionMessageParam[] => {
+          return msgs.map(msg => {
+            if (msg.role === 'user' && typeof msg.content !== 'string' && Array.isArray(msg.content)) {
+              // Keep only text parts (this includes "Added file: <filename>" paths)
+              const textParts = msg.content.filter(part => part.type === 'text');
+
+              // If we had images, convert to string content (or empty if no text)
+              if (textParts.length > 0) {
+                return {
+                  ...msg,
+                  content: textParts,
+                };
+              }
+
+              // If no text parts, return empty string
+              return {
+                ...msg,
+                content: ''
+              };
+            }
+            return msg;
+          });
+        };
+
+        // Tool results can only carry text, so images from tools (e.g. `read` on a PNG) are
+        // sent in a user message after the run of tool results they belong to.
+        const moveToolImagesToUserMessages = (msgs: AIMessage[]): AIMessage[] => {
+          const result: AIMessage[] = [];
+          let pending: OpenAI.Chat.Completions.ChatCompletionContentPartImage[] = [];
+
+          const flush = () => {
+            if (pending.length === 0) return;
+            result.push({ role: 'user', content: [{ type: 'text', text: 'Images from the tool results above:' }, ...pending] });
+            pending = [];
+          };
+
+          for (const msg of msgs) {
+            if (msg.role !== 'tool') flush();
+            if (msg.role === 'tool' && Array.isArray(msg.content)) {
+              const text = msg.content.flatMap((part) => part.type === 'text' ? [part.text] : []).join('\n');
+              pending.push(...msg.content.flatMap((part) => part.type === 'image_url' ? [part] : []));
+              result.push({ role: 'tool', tool_call_id: msg.tool_call_id, content: text });
+            } else {
+              result.push(msg);
+            }
+          }
+          flush();
+
+          return result;
+        };
+
+        // Prepare messages for AI
+        // Note: User messages with image_url content parts are valid ChatCompletionMessageParam types
+        // The AIMessage type includes ChatCompletionMessageParam, so this cast is safe
+        // Evicting old tool images is a send-time transformation only — session.messages stays intact for the UI.
+        const history = moveToolImagesToUserMessages(evictOldToolImages(session.messages));
+        let messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = (systemPrompt
+          ? [{ role: 'system', content: systemPrompt }, ...history]
+          : history) as OpenAI.Chat.Completions.ChatCompletionMessageParam[];
+
+        // Filter out unsupported image formats (keep only JPG/JPEG/PNG for API)
+        // This ensures the UI shows all image types, but API only receives supported formats
+        messages = filterSupportedImages(messages);
+
+        // `reasoning_content` is a plain-text alias for the same reasoning; send only the signed blocks.
+        messages = messages.map((msg) => {
+          if (msg.role === 'assistant' && 'reasoning_details' in msg && 'reasoning_content' in msg) {
+            const { reasoning_content: _, ...rest } = msg as AIMessage & { reasoning_content?: string };
+            return rest as OpenAI.Chat.Completions.ChatCompletionMessageParam;
+          }
+          return msg;
+        });
+
+        // If this session has already determined images aren't supported, strip them proactively
+        if (session.imagesNotSupported) {
+          messages = stripImageUrls(messages);
+        }
+
+        // Prepare completion options
+        const completionOptions: OpenAI.Chat.Completions.ChatCompletionCreateParams = {
+          model,
+          messages,
+          tools: session.tools && Object.keys(session.tools).length > 0 ? Object.values(session.tools) : undefined,
+          stream: true,
+          stream_options: {
+            include_usage: true,
+          },
+        };
+
+        // OpenRouter maps the effort to each model's own setting and ignores it for models that don't reason.
+        const reasoningEffort = settings.reasoningEffort ?? DEFAULT_REASONING_EFFORT;
+        if (reasoningEffort !== 'default' && isOpenRouter(provider)) {
+          (completionOptions as { reasoning?: { effort: string } }).reasoning = { effort: reasoningEffort };
+        }
+
+        // Check if messages contain any images (for retry logic)
+        const hasImages = messages.some(msg => {
+          if (msg.role === 'user' && typeof msg.content !== 'string' && Array.isArray(msg.content)) {
+            return msg.content.some(part => part.type === 'image_url');
+          }
+          return false;
+        });
+
+        // `x-session-id` lets providers keep the conversation on one cache (OpenRouter's sticky
+        // routing, Meridian's session resume). Every preset provider's CORS policy allows it.
+        const requestOptions: OpenAI.RequestOptions = {
+          signal,
+          headers: { 'x-session-id': session.sessionName },
+        };
+
+        // Generate streaming response with retry logic for models that don't support images
+        let stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>;
+        let retriedWithoutImages = false;
+
+        try {
+          stream = await openai.chat.completions.create(completionOptions, requestOptions);
+        } catch (error) {
+          // Only an error that says images are the problem may strip them: unrelated 400s (e.g. Meridian's
+          // session_turn_conflict for a duplicate request) would otherwise blind the model for the whole session.
+          if (isImageUnsupportedError(error) && hasImages && !retriedWithoutImages) {
+            console.warn('API call failed, retrying without image_url parts (keeping VFS paths):', error);
+            retriedWithoutImages = true;
+
+            // Strip image_url parts but keep text parts (including VFS paths)
+            const messagesWithoutImages = stripImageUrls(messages);
+
+            // Update completion options with stripped messages
+            const retryOptions: OpenAI.Chat.Completions.ChatCompletionCreateParams = {
+              ...completionOptions,
+              messages: messagesWithoutImages
+            };
+
+            // Retry the API call - if this succeeds, we know images were the problem
+            stream = await openai.chat.completions.create(retryOptions, requestOptions);
+
+            // SUCCESS: The retry without images worked, so this model doesn't support images
+            // Mark this session as not supporting images to avoid future retries
+            session.imagesNotSupported = true;
+            console.log('Retry without images succeeded - marking this session as not supporting images');
+          } else {
+            // Re-throw if not a potential image error or already retried
+            throw error;
+          }
+        }
+
+        let accumulatedContent = '';
+        let accumulatedReasoningContent = '';
+        const accumulatedReasoningDetails: ReasoningDetail[] = [];
+        const accumulatedToolCalls: Map<number, OpenAI.Chat.Completions.ChatCompletionMessageFunctionToolCall> = new Map();
+        let finishReason: string | null = null;
+
+        // Process the stream
+        let usage: { prompt_tokens: number; completion_tokens: number; cost?: number } | undefined;
+        for await (const chunk of stream) {
+          // Check if session was cancelled
+          if (signal.aborted) break;
+
+          const delta = chunk.choices[0]?.delta as OpenAI.Chat.Completions.ChatCompletionChunk.Choice.Delta | undefined;
+
+          if (delta?.content) {
+            accumulatedContent += delta.content;
+            if (session.streamingMessage) {
+              session.streamingMessage.content += delta.content;
+              this.emit('streamingUpdate', projectId, session.streamingMessage.content, session.streamingMessage.reasoning_content, session.streamingMessage.tool_calls);
+            }
+          }
+
+          // Handle reasoning content if present (some providers may include this)
+          let reasoningContent: string | undefined;
+          // LiteLLM, Z.ai, etc. use 'reasoning_content'
+          if (delta && 'reasoning_content' in delta && typeof delta.reasoning_content === 'string') {
+            reasoningContent = delta.reasoning_content;
+            // ollama uses 'reasoning'
+          } else if (delta && 'reasoning' in delta && typeof delta.reasoning === 'string') {
+            reasoningContent = delta.reasoning;
+          }
+          // OpenRouter also sends structured blocks, which must be sent back for Claude to keep its thinking.
+          if (delta && 'reasoning_details' in delta && Array.isArray(delta.reasoning_details)) {
+            mergeReasoningDetails(accumulatedReasoningDetails, delta.reasoning_details as ReasoningDetail[]);
+          }
+          if (reasoningContent) {
+            accumulatedReasoningContent += reasoningContent;
+            if (session.streamingMessage) {
+              session.streamingMessage.reasoning_content += reasoningContent;
+              this.emit('streamingUpdate', projectId, session.streamingMessage.content, session.streamingMessage.reasoning_content, session.streamingMessage.tool_calls);
+            }
+          }
+
+          if (delta?.tool_calls) {
+            for (let i = 0; i < delta.tool_calls.length; i++) {
+              const toolCallDelta = delta.tool_calls[i];
+              const index = toolCallDelta.index ?? i; // Fix for Gemini models
+
+              let toolCall = accumulatedToolCalls.get(index);
+
+              if (!toolCall) {
+                toolCall = {
+                  id: '',
+                  type: 'function',
+                  function: { name: '', arguments: '' },
+                };
+              }
+
+              if (toolCallDelta.id) toolCall.id = toolCallDelta.id;
+              if (toolCallDelta.function?.name) toolCall.function.name = toolCallDelta.function.name;
+              if (toolCallDelta.function?.arguments) toolCall.function.arguments += toolCallDelta.function.arguments;
+
+              accumulatedToolCalls.set(index, toolCall);
+            }
+
+            if (session.streamingMessage && accumulatedToolCalls.size > 0) {
+              const sortedToolCalls = [...accumulatedToolCalls.entries()]
+                .sort((a, b) => a[0] - b[0])
+                .map(entry => entry[1]);
+
+              session.streamingMessage.tool_calls = sortedToolCalls;
+              this.emit('streamingUpdate', projectId, session.streamingMessage.content, session.streamingMessage.reasoning_content, session.streamingMessage.tool_calls);
+            }
+          }
+
+          if (chunk.choices[0]?.finish_reason) {
+            finishReason = chunk.choices[0].finish_reason;
+          }
+
+          // Capture usage data if available (some providers include it in the final chunk)
+          if (chunk.usage) {
+            const cost = 'cost' in chunk.usage && typeof chunk.usage.cost === 'number'
+              ? chunk.usage.cost
+              : undefined;
+
+            usage = {
+              prompt_tokens: chunk.usage.prompt_tokens || 0,
+              completion_tokens: chunk.usage.completion_tokens || 0,
+              cost,
+            };
+          }
+        }
+
+        // Stopped while streaming: the partial response is discarded
+        if (signal.aborted) return;
+
+        // Fix tool calls with empty arguments or names
+        for (const toolCall of accumulatedToolCalls.values()) {
+          if (toolCall.type === 'function') {
+            toolCall.function.arguments = toolCall.function.arguments || '{}';
+
+            // Log and handle empty tool names (malformed AI response)
+            if (!toolCall.function.name || toolCall.function.name.trim() === '') {
+              console.error('Malformed tool call detected: missing function name', {
+                projectId,
+                providerModel,
+                toolCallId: toolCall.id,
+                toolCall: JSON.stringify(toolCall),
+              });
+            }
+          }
+        }
+
+        // Create final assistant message
+        const assistantMessage: AIMessage = {
+          role: 'assistant',
+          content: accumulatedContent,
+          ...(accumulatedReasoningContent && { reasoning_content: accumulatedReasoningContent }),
+          ...(accumulatedReasoningDetails.length > 0 && { reasoning_details: accumulatedReasoningDetails }),
+          ...(accumulatedToolCalls.size > 0 && { tool_calls: [...accumulatedToolCalls.values()] })
+        };
+
+        // Check if the assistant message is empty (no content, reasoning, or tool calls)
+        if (isEmptyMessage(assistantMessage) && finishReason !== 'stop') {
+          console.error('Empty assistant message detected', {
+            projectId,
+            providerModel,
+            finishReason,
+          });
+
+          throw new EmptyMessageError(
+            'The AI generated an empty response. This may be due to a provider issue or model configuration problem.',
+            providerModel,
+          );
+        }
+
+        // Add final message but keep streaming message until finally block
+        await this.addMessage(projectId, assistantMessage);
+
+        // Update cost if usage data is available
+        if (usage) {
+          await this.updateSessionCost(projectId, usage, providerModel);
+        }
+
+        // Handle tool calls
+        if (accumulatedToolCalls?.size) {
+          for (const toolCall of accumulatedToolCalls.values()) {
+            // Stopped: stopGeneration has already answered the calls that hadn't finished
+            if (signal.aborted) return;
+            if (toolCall.type !== 'function') continue;
+
+            const functionToolCall = toolCall as OpenAI.Chat.Completions.ChatCompletionMessageFunctionToolCall;
+            const toolName = functionToolCall.function.name;
+
+            // Check for missing/empty tool name (malformed AI response)
+            if (!toolName || toolName.trim() === '') {
+              // Add detailed technical error to tool message for debugging
+              await this.addToolMessage(
+                projectId,
+                functionToolCall.id,
+                `Error: Malformed tool call received from AI provider (missing function name). This is likely a provider-specific issue. Tool call ID: ${functionToolCall.id}`
+              );
+
+              // Throw custom error to trigger Quilly UI with user-friendly message
+              throw new MalformedToolCallError(
+                'The AI provider sent an incomplete response. This may be due to a network interruption or provider issue.',
+                functionToolCall.id,
+                providerModel
+              );
+            }
+
+            const tool = session.customTools[toolName];
+
+            if (!tool) {
+              await this.addToolMessage(projectId, functionToolCall.id, `Tool "${toolName}" not found`);
+              continue;
+            }
+
+            try {
+              let toolArgs: unknown;
+              if (tool.inputSchema) {
+                toolArgs = tool.inputSchema.parse(JSON.parse(functionToolCall.function.arguments || '{}'));
+              } else {
+                // For tools without inputSchema, use empty object or parsed arguments as-is
+                const rawArgs = functionToolCall.function.arguments;
+                toolArgs = rawArgs ? JSON.parse(rawArgs) : {};
+              }
+              const result = await tool.execute(toolArgs, { signal });
+
+              // Stopped while the tool ran. Its call was already answered as cancelled, and adding
+              // this result now would put it after whatever came next.
+              if (signal.aborted) {
+                if (result.cost !== undefined) await this.accumulateProjectCost(projectId, result.cost);
+                return;
+              }
+
+              await this.addToolMessage(projectId, functionToolCall.id, result.content, result.images);
+
+              // Update session cost if tool returned a cost
+              if (result.cost !== undefined) {
+                const updatedSession = this.sessions.get(projectId);
+                if (updatedSession) {
+                  const currentCost = updatedSession.totalCost || 0;
+                  updatedSession.totalCost = currentCost + result.cost;
+                  this.sessions.set(projectId, updatedSession);
+                  this.emit('costUpdated', projectId, updatedSession.totalCost);
+
+                  // Accumulate tool cost to project total
+                  await this.accumulateProjectCost(projectId, result.cost);
+                }
+              }
+            } catch (error) {
+              if (signal.aborted) return;
+              const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+              await this.addToolMessage(projectId, functionToolCall.id, `Error with tool ${toolName}: ${errorMsg}`);
+            }
+          }
+        }
+
+        if (signal.aborted) return;
+
+        // Update and save the finish reason
+        session.lastFinishReason = finishReason;
+        this.emit('finishReasonChanged', projectId, finishReason);
+        await this.saveFinishReason(projectId, finishReason);
+
+        // The turn is over when finished or when the model produced no tool calls (prevents 50-turn runaway loop, fixes F-011)
+        const hasToolCalls = Boolean(accumulatedToolCalls?.size);
+        if (finishReason === 'stop' || !hasToolCalls) {
+          if (!signal.aborted && await this.flushQueue(projectId)) {
+            stepCount = 0;
+            continue;
+          }
+          break;
+        }
+      }
+    } catch (error) {
+      console.error('AI generation error:', error);
+
+      // Handle user cancellation
+      if (error instanceof OpenAI.APIUserAbortError || (error instanceof Error && error.name === 'AbortError')) {
+        return; // User cancelled
+      }
+
+      // Log unexpected TypeErrors to Sentry for investigation
+      if (error instanceof TypeError) {
+        getSentryInstance()?.captureException(error);
+      }
+
+      // Re-throw service errors to be handled at the UI level
+      throw error;
+    } finally {
+      // A newer turn may have started after this one was stopped; leave its state alone.
+      if (session && (session.abortController === controller || !session.abortController)) {
+        session.isLoading = false;
+        session.streamingMessage = undefined;
+        session.abortController = undefined;
+        this.emit('loadingChanged', projectId, false);
+      }
+    }
+  }
+
+  /**
+   * Stop AI generation for a session
+   */
+  stopGeneration(projectId: string): void {
+    const session = this.sessions.get(projectId);
+    if (!session) return;
+
+    session.abortController?.abort('User stopped generation');
+    session.isLoading = false;
+    session.streamingMessage = undefined;
+    session.abortController = undefined;
+
+    // Tool calls that were still running are answered now, so the model knows they were cancelled
+    // and the next message doesn't land between a tool call and its result.
+    const cancelled = this.answerOpenToolCalls(session, CANCELLED_TOOL_RESULT);
+    for (const message of cancelled) {
+      this.emit('messageAdded', projectId, message);
+    }
+    if (cancelled.length > 0) {
+      void this.saveSessionHistory(projectId);
+    }
+
+    this.emit('loadingChanged', projectId, false);
+  }
+
+  /** Answer the tool calls at the end of the history that have no result yet. Returns the results added. */
+  private answerOpenToolCalls(session: SessionState, content: string): AIMessage[] {
+    const answered = new Set<string>();
+    for (let i = session.messages.length - 1; i >= 0; i--) {
+      const message = session.messages[i];
+      if (message.role === 'tool') {
+        answered.add(message.tool_call_id);
+        continue;
+      }
+      if (message.role !== 'assistant' || !message.tool_calls?.length) return [];
+
+      const added: AIMessage[] = message.tool_calls
+        .filter((call) => !answered.has(call.id))
+        .map((call) => ({ role: 'tool', tool_call_id: call.id, content }));
+      session.messages.push(...added);
+      return added;
+    }
+    return [];
+  }
+
+  /**
+   * Start a new session (clear messages but keep configuration)
+   */
+  async startNewSession(projectId: string): Promise<void> {
+    const session = this.sessions.get(projectId);
+    if (!session) return;
+
+    this.stopGeneration(projectId);
+
+    session.messages = [];
+    session.streamingMessage = undefined;
+    session.sessionName = DotAI.generateSessionName();
+    session.systemPrompt = undefined;
+    session.lastActivity = new Date();
+    session.totalCost = 0;
+    session.lastInputTokens = 0;
+    session.lastFinishReason = null;
+    this.setQueue(projectId, []);
+
+    this.emit('costUpdated', projectId, 0);
+    this.emit('contextUsageUpdated', projectId, 0);
+    this.emit('finishReasonChanged', projectId, null);
+  }
+
+  /**
+   * Check if content exceeds size/line limits
+   */
+  private exceedsLimits(content: string): boolean {
+    const MAX_SIZE_BYTES = 50 * 1024; // 50 KiB
+    const MAX_LINES = 2000;
+
+    const sizeBytes = new Blob([content]).size;
+    const lineCount = content.split('\n').length;
+
+    return sizeBytes > MAX_SIZE_BYTES || lineCount > MAX_LINES;
+  }
+
+  /**
+   * Save content to tmpDir and return the file path
+   */
+  private async saveToTmpFile(_projectId: string, content: string, toolCallId: string): Promise<string> {
+    const config = this.getConfig();
+    const timestamp = Date.now();
+    const safeToolCallId = toolCallId.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const filename = `tool-output-${safeToolCallId}-${timestamp}.txt`;
+    const filepath = `${config.fsPathTmp}/${filename}`;
+
+    try {
+      await this.fs.mkdir(config.fsPathTmp, { recursive: true });
+    } catch {
+      // Directory may already exist
+    }
+    await this.fs.writeFile(filepath, content, 'utf8');
+    return filepath;
+  }
+
+  /**
+   * Helper to add tool messages and update conversation
+   */
+  private async addToolMessage(projectId: string, toolCallId: string, content: string, images: string[] = []): Promise<void> {
+    let finalContent = content;
+
+    // Check if content exceeds limits
+    if (this.exceedsLimits(content)) {
+      // Save full content to tmp file
+      const filepath = await this.saveToTmpFile(projectId, content, toolCallId);
+
+      // Create placeholder message
+      finalContent = `The tool call succeeded but the output was truncated. Full output saved to: ${filepath}\nUse \`grep\` to search the full content or \`read\` with offset/limit to view specific sections.`;
+    }
+
+    const toolMessage: AIMessage = images.length > 0
+      ? {
+        role: 'tool',
+        content: [{ type: 'text', text: finalContent }, ...images.map((url) => ({ type: 'image_url' as const, image_url: { url } }))],
+        tool_call_id: toolCallId,
+      }
+      : {
+        role: 'tool',
+        content: finalContent,
+        tool_call_id: toolCallId
+      };
+
+    await this.addMessage(projectId, toolMessage);
+  }
+
+  /**
+   * Update session cost and context usage based on usage data
+   */
+  private async updateSessionCost(projectId: string, usage: { prompt_tokens: number; completion_tokens: number; cost?: number }, providerModel: string): Promise<void> {
+    if (!this.getProviderModels) return;
+
+    const session = this.sessions.get(projectId);
+    if (!session) return;
+
+    // Always record input tokens for context usage tracking even when provider reports direct cost (fixes F-011)
+    if (typeof usage.prompt_tokens === 'number') {
+      session.lastInputTokens = usage.prompt_tokens;
+      this.emit('contextUsageUpdated', projectId, usage.prompt_tokens);
+    }
+
+    // If provider gives direct cost, use it
+    if (typeof usage.cost === 'number') {
+      session.totalCost = (session.totalCost || 0) + usage.cost;
+      this.emit('costUpdated', projectId, session.totalCost);
+
+      // Accumulate cost to project total
+      await this.accumulateProjectCost(projectId, usage.cost);
+      return;
+    }
+
+    // Otherwise, get the cost from the models endpoint
+    try {
+      const settings = this.getSettings();
+      const parsed = parseProviderModel(providerModel, settings.providers);
+      const modelName = parsed.model;
+      const provider = parsed.provider;
+
+      // Find the model in provider models to get pricing and context length
+      const models = this.getProviderModels();
+      const model = models.find(m => m.id === modelName && m.provider === provider.id);
+
+      // Update input tokens for context usage tracking
+      session.lastInputTokens = usage.prompt_tokens;
+      this.emit('contextUsageUpdated', projectId, usage.prompt_tokens);
+
+      if (!model?.pricing) {
+        return;
+      }
+
+      // Calculate cost for this request
+      const promptCost = model.pricing.prompt.times(usage.prompt_tokens);
+      const completionCost = model.pricing.completion.times(usage.completion_tokens);
+      const requestCost = promptCost.add(completionCost).toNumber();
+
+      // Update session total cost
+      session.totalCost = (session.totalCost || 0) + requestCost;
+      this.emit('costUpdated', projectId, session.totalCost);
+
+      // Accumulate cost to project total
+      await this.accumulateProjectCost(projectId, requestCost);
+    } catch (error) {
+      console.warn('Failed to calculate session cost:', error);
+    }
+  }
+
+  /**
+   * Save session history to file
+   */
+  private async saveSessionHistory(projectId: string): Promise<void> {
+    const session = this.sessions.get(projectId);
+    if (!session) return;
+
+    // Keep what's shown and sent the same as what's saved. Repairing never touches the open tool
+    // calls at the end, which may still be running.
+    const repaired = repairHistory(session.messages);
+    if (repaired.repaired) {
+      console.warn('Repaired the session history: some messages were lost or out of order');
+      session.messages = repaired.messages;
+      this.emit('messagesReplaced', projectId, [...session.messages]);
+    }
+
+    try {
+      const config = this.getConfig();
+      const dotAI = new DotAI(this.fs, `${config.fsPathProjects}/${session.projectId}`);
+      // Cast to ChatCompletionMessageParam[] - user messages with image arrays are valid
+      await dotAI.setHistory(session.sessionName, session.messages as OpenAI.Chat.Completions.ChatCompletionMessageParam[]);
+    } catch (error) {
+      console.error('Failed to save session history:', error);
+      getSentryInstance()?.captureException(error);
+    }
+  }
+
+  /**
+   * Save finish reason to file
+   */
+  private async saveFinishReason(projectId: string, finishReason: string | null): Promise<void> {
+    try {
+      const config = this.getConfig();
+      const dotAI = new DotAI(this.fs, `${config.fsPathProjects}/${projectId}`);
+      await dotAI.writeFinishReason(finishReason);
+    } catch (error) {
+      console.warn('Failed to save finish reason:', error);
+    }
+  }
+
+  /**
+   * Accumulate request cost to the project's total cost file
+   */
+  private async accumulateProjectCost(projectId: string, requestCost: number): Promise<void> {
+    try {
+      const config = this.getConfig();
+      const dotAI = new DotAI(this.fs, `${config.fsPathProjects}/${projectId}`);
+
+      // Read current project total
+      const currentTotal = await dotAI.readCost();
+
+      // Add this request's cost
+      const newTotal = currentTotal + requestCost;
+
+      // Write back the new total
+      await dotAI.writeCost(newTotal);
+    } catch (error) {
+      console.warn('Failed to accumulate project cost:', error);
+    }
+  }
+
+  /**
+   * Simplified event system
+   */
+  on<K extends keyof SessionManagerEvents>(event: K, listener: SessionManagerEvents[K]): void {
+    if (!this.listeners[event]) this.listeners[event] = new Set();
+    this.listeners[event]!.add(listener as (...args: unknown[]) => void);
+  }
+
+  off<K extends keyof SessionManagerEvents>(event: K, listener: SessionManagerEvents[K]): void {
+    this.listeners[event]?.delete(listener as (...args: unknown[]) => void);
+  }
+
+  emit<K extends keyof SessionManagerEvents>(event: K, ...args: Parameters<SessionManagerEvents[K]>): void {
+    this.listeners[event]?.forEach(listener => {
+      try {
+        listener(...args);
+      } catch (error) {
+        console.error('Event listener error:', error);
+      }
+    });
+  }
+
+  /**
+   * Cleanup - stop all sessions and clear data
+   */
+  async cleanup(): Promise<void> {
+    this.sessions.forEach((_, projectId) => this.stopGeneration(projectId));
+
+    this.sessions.clear();
+    this.listeners = {};
+  }
+}

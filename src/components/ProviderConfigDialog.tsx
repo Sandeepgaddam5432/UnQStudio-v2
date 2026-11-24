@@ -1,0 +1,328 @@
+import { useState, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Trash2, Rocket } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { PasswordInput } from '@/components/ui/password-input';
+import { Label } from '@/components/ui/label';
+import { Checkbox } from '@/components/ui/checkbox';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from '@/components/ui/dialog';
+import type { DeployProvider } from '@/contexts/DeploySettingsContext';
+import type { PresetDeployProvider } from '@/lib/deploy/types';
+import { ExternalFavicon } from '@/components/ExternalFavicon';
+import { UrlListEditor } from '@/components/UrlListEditor';
+
+interface ProviderConfigDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  provider: DeployProvider;
+  preset?: PresetDeployProvider;
+  onUpdate: (provider: DeployProvider) => void;
+  onRemove: () => void;
+}
+
+/**
+ * Normalize a URL string to ensure it has a protocol
+ * @param url - The URL string to normalize
+ * @returns A fully-qualified URL string
+ */
+function normalizeUrl(url: string): string {
+  // If it already has a protocol, return as-is
+  if (/^https?:\/\//i.test(url)) {
+    return url;
+  }
+
+  // Add https:// prefix
+  return `https://${url}`;
+}
+
+export function ProviderConfigDialog({
+  open,
+  onOpenChange,
+  provider,
+  preset,
+  onUpdate,
+  onRemove,
+}: ProviderConfigDialogProps) {
+  const { t } = useTranslation();
+  const [localProvider, setLocalProvider] = useState(provider);
+
+  // Reset local state when provider changes or dialog opens
+  useEffect(() => {
+    if (open) {
+      setLocalProvider(provider);
+    }
+  }, [provider, open]);
+
+  const handleSave = () => {
+    onUpdate(localProvider);
+    onOpenChange(false);
+  };
+
+  const handleDelete = () => {
+    onRemove();
+    onOpenChange(false);
+  };
+
+  // Use baseURL from configured provider, falling back to preset baseURL
+  const baseURL = ('baseURL' in localProvider && localProvider.baseURL) || preset?.baseURL;
+
+  // A gateway is recognised by the domain it serves, not by its API origin
+  const gatewayUrl = localProvider.type === 'npanel' ? normalizeUrl(localProvider.domain) : undefined;
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-md max-h-[90vh] flex flex-col">
+        <DialogHeader className="shrink-0">
+          <div className="flex items-center gap-2">
+            <ExternalFavicon
+              url={gatewayUrl || baseURL}
+              size={20}
+              fallback={<Rocket size={20} />}
+            />
+            <DialogTitle>{localProvider.name}</DialogTitle>
+          </div>
+          <DialogDescription>
+            {preset?.description || 'Configure your deployment provider'}
+          </DialogDescription>
+        </DialogHeader>
+
+        {/* The fields scroll, the buttons don't: a provider with relay and
+            blossom lists is taller than a phone, and a Save button below the
+            fold is a Save button nobody can press. */}
+        <div className="flex-1 overflow-y-auto space-y-4 py-4 px-1 -mx-1">
+          <div className="grid gap-2">
+            <Label htmlFor="provider-name">
+              Name <span className="text-destructive">*</span>
+            </Label>
+            <Input
+              id="provider-name"
+              placeholder="Provider name"
+              value={localProvider.name}
+              onChange={(e) => setLocalProvider({ ...localProvider, name: e.target.value })}
+            />
+          </div>
+
+          {localProvider.type === 'npanel' ? (
+            <>
+              <p className="text-sm text-muted-foreground">
+                {t('shakespeareDeployNostrAuth')}
+              </p>
+              <div className="grid gap-2">
+                <Label htmlFor="provider-domain">
+                  Domain <span className="text-destructive">*</span>
+                </Label>
+                <Input
+                  id="provider-domain"
+                  placeholder="shakespeare.wtf"
+                  value={localProvider.domain}
+                  onChange={(e) => setLocalProvider({ ...localProvider, domain: e.target.value })}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Sites get a name under this domain.
+                </p>
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="provider-dashboard-host">
+                  Gateway API <span className="text-destructive">*</span>
+                </Label>
+                <Input
+                  id="provider-dashboard-host"
+                  placeholder="npanel.shakespeare.to"
+                  value={localProvider.dashboardHost}
+                  onChange={(e) => setLocalProvider({ ...localProvider, dashboardHost: e.target.value })}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Where names are claimed. Usually a different host from the one above.
+                </p>
+              </div>
+              <UrlListEditor
+                label="Relay URLs"
+                items={localProvider.relayUrls ?? []}
+                onChange={(urls) => setLocalProvider({ ...localProvider, relayUrls: urls })}
+                protocol="wss"
+                placeholder="relay.ditto.pub"
+                required
+              />
+              <UrlListEditor
+                label="Blossom Servers"
+                items={localProvider.blossomServers ?? []}
+                onChange={(servers) => setLocalProvider({ ...localProvider, blossomServers: servers })}
+                protocol="https"
+                placeholder="blossom.ditto.pub"
+                required
+              />
+            </>
+          ) : localProvider.type === 'nsite' ? (
+            <>
+              <div className="grid gap-2">
+                <Label htmlFor="provider-gateway">
+                  Gateway <span className="text-destructive">*</span>
+                </Label>
+                <Input
+                  id="provider-gateway"
+                   placeholder="shakespeare.to"
+                  value={localProvider.gateway || ''}
+                  onChange={(e) => setLocalProvider({ ...localProvider, gateway: e.target.value })}
+                />
+              </div>
+              <UrlListEditor
+                label="Relay URLs"
+                items={localProvider.relayUrls ?? []}
+                onChange={(urls) => setLocalProvider({ ...localProvider, relayUrls: urls })}
+                protocol="wss"
+                placeholder="relay.ditto.pub"
+                required
+              />
+              <UrlListEditor
+                label="Blossom Servers"
+                items={localProvider.blossomServers ?? []}
+                onChange={(servers) => setLocalProvider({ ...localProvider, blossomServers: servers })}
+                protocol="https"
+                placeholder="blossom.ditto.pub"
+                required
+              />
+            </>
+          ) : (
+            <>
+              {localProvider.type === 'cloudflare' && (
+                <div className="grid gap-2">
+                  <Label htmlFor="provider-accountId">
+                    {preset?.accountIdLabel || 'Account ID'} <span className="text-destructive">*</span>
+                  </Label>
+                  <Input
+                    id="provider-accountId"
+                    placeholder="Enter Account ID"
+                    value={localProvider.accountId}
+                    onChange={(e) => setLocalProvider({ ...localProvider, accountId: e.target.value })}
+                  />
+                </div>
+              )}
+              {localProvider.type === 'deno' && (
+                <div className="grid gap-2">
+                  <Label htmlFor="provider-organizationId">
+                    {preset?.organizationIdLabel || 'Organization ID'} <span className="text-destructive">*</span>
+                  </Label>
+                  <Input
+                    id="provider-organizationId"
+                    placeholder="Enter Organization ID"
+                    value={localProvider.organizationId}
+                    onChange={(e) => setLocalProvider({ ...localProvider, organizationId: e.target.value })}
+                  />
+                </div>
+              )}
+              <div className="grid gap-2">
+                <Label htmlFor="provider-apiKey">
+                  {preset?.apiKeyLabel || t('apiKey')} <span className="text-destructive">*</span>
+                </Label>
+                <PasswordInput
+                  id="provider-apiKey"
+                  placeholder={t('enterApiKey')}
+                  value={localProvider.apiKey}
+                  onChange={(e) => {
+                    if (localProvider.type === 'netlify') {
+                      setLocalProvider({ ...localProvider, apiKey: e.target.value });
+                    } else if (localProvider.type === 'vercel') {
+                      setLocalProvider({ ...localProvider, apiKey: e.target.value });
+                    } else if (localProvider.type === 'cloudflare') {
+                      setLocalProvider({ ...localProvider, apiKey: e.target.value });
+                    } else if (localProvider.type === 'deno') {
+                      setLocalProvider({ ...localProvider, apiKey: e.target.value });
+                    } else if (localProvider.type === 'railway') {
+                      setLocalProvider({ ...localProvider, apiKey: e.target.value });
+                    }
+                  }}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="provider-baseURL">
+                  Base URL (Optional)
+                </Label>
+                <Input
+                  id="provider-baseURL"
+                  placeholder={
+                    localProvider.type === 'netlify' ? 'https://api.netlify.com/api/v1' :
+                      localProvider.type === 'vercel' ? 'https://api.vercel.com' :
+                        localProvider.type === 'cloudflare' ? 'https://api.cloudflare.com/client/v4' :
+                          localProvider.type === 'deno' ? 'https://api.deno.com/v1' :
+                            localProvider.type === 'railway' ? 'https://backboard.railway.app/graphql/v2' :
+                              'Base URL'
+                  }
+                  value={localProvider.baseURL || ''}
+                  onChange={(e) => {
+                    if (localProvider.type === 'netlify') {
+                      setLocalProvider({ ...localProvider, baseURL: e.target.value });
+                    } else if (localProvider.type === 'vercel') {
+                      setLocalProvider({ ...localProvider, baseURL: e.target.value });
+                    } else if (localProvider.type === 'cloudflare') {
+                      setLocalProvider({ ...localProvider, baseURL: e.target.value });
+                    } else if (localProvider.type === 'deno') {
+                      setLocalProvider({ ...localProvider, baseURL: e.target.value });
+                    } else if (localProvider.type === 'railway') {
+                      setLocalProvider({ ...localProvider, baseURL: e.target.value });
+                    }
+                  }}
+                />
+              </div>
+              {(localProvider.type === 'cloudflare' || localProvider.type === 'deno') && (
+                <div className="grid gap-2">
+                  <Label htmlFor="provider-baseDomain">
+                    Base Domain (Optional)
+                  </Label>
+                  <Input
+                    id="provider-baseDomain"
+                    placeholder={localProvider.type === 'cloudflare' ? 'workers.dev' : 'deno.dev'}
+                    value={localProvider.baseDomain || ''}
+                    onChange={(e) => setLocalProvider({ ...localProvider, baseDomain: e.target.value })}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {localProvider.type === 'cloudflare'
+                      ? 'The domain suffix for deployed workers (e.g., workers.dev)'
+                      : 'The domain suffix for deployed projects (e.g., deno.dev)'}
+                  </p>
+                </div>
+              )}
+              <div className="flex items-center space-x-2">
+                <Checkbox
+                  id="provider-proxy"
+                  checked={localProvider.proxy || false}
+                  onCheckedChange={(checked) => setLocalProvider({ ...localProvider, proxy: checked === true })}
+                />
+                <Label
+                  htmlFor="provider-proxy"
+                  className="text-sm font-normal cursor-pointer"
+                >
+                  Use CORS Proxy
+                </Label>
+              </div>
+            </>
+          )}
+        </div>
+
+        <DialogFooter className="gap-2 shrink-0">
+          <Button
+            variant="destructive"
+            onClick={handleDelete}
+            className="sm:mr-auto"
+          >
+            <Trash2 className="h-4 w-4 mr-2" />
+            {t('delete')}
+          </Button>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            {t('cancel')}
+          </Button>
+          <Button onClick={handleSave}>
+            {t('save')}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
